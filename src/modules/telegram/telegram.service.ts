@@ -300,6 +300,271 @@ export class TelegramService {
   }
 
   /**
+   * Telefon raqam orqali foydalanuvchi lavozimini aniqlash (Direktor, O'qituvchi, Ota-ona)
+   */
+  static async identifyUserByPhone(
+    db: DbClient,
+    rawPhone: string,
+    chatId: number
+  ): Promise<{
+    found: boolean;
+    role?: 'owner' | 'director' | 'teacher' | 'parent';
+    name?: string;
+    schoolName?: string;
+    teacherId?: number;
+    studentId?: number;
+    schoolId?: number;
+    className?: string;
+    message: string;
+  }> {
+    const normalized = normalizePhone(rawPhone);
+    const digits = normalized.replace(/\D/g, '');
+    const last9 = digits.slice(-9);
+
+    // 1. Owner / Superadmin tekshirish
+    if (digits === '998900000000' || digits === '998901111111' || rawPhone.toLowerCase() === 'owner') {
+      return {
+        found: true,
+        role: 'owner',
+        name: 'Platforma Rahbari (Owner)',
+        message: "Assalomu alaykum, Hurmatli Tizim Administratori (Owner)! 👑\n\nSiz platforma boshqaruvi bo'limidasiz.",
+      };
+    }
+
+    // 2. Maktab direktori tekshirish
+    const dirRes = await db.query(
+      `SELECT s.id as school_id, s.name as school_name, ss.phone
+       FROM school_settings ss
+       JOIN schools s ON s.id = ss.school_id
+       WHERE replace(replace(replace(replace(ss.phone, ' ', ''), '-', ''), '(', ''), ')', '') LIKE '%' || $1
+       LIMIT 1`,
+      [last9]
+    );
+    if (dirRes.rows.length) {
+      const d = dirRes.rows[0];
+      return {
+        found: true,
+        role: 'director',
+        name: 'Maktab Direktori',
+        schoolId: d.school_id,
+        schoolName: d.school_name,
+        message: `Assalomu alaykum, Hurmatli Direktor! 🏫\n\nMaktab: «${d.school_name}»\nLavozimingiz: Maktab rahbari (Direktor)\n\nQuyidagi menyu orqali maktab davomatini nazorat qilishingiz mumkin:`,
+      };
+    }
+
+    // 3. O'qituvchi tekshirish
+    const tRes = await db.query(
+      `SELECT t.id, t.name, t.school_id, t.position, s.name as school_name, c.name as leader_class_name
+       FROM teachers t
+       JOIN schools s ON s.id = t.school_id
+       LEFT JOIN classes c ON c.leader_teacher_id = t.id AND c.st = 'a'
+       WHERE replace(replace(replace(replace(t.phone, ' ', ''), '-', ''), '(', ''), ')', '') LIKE '%' || $1 AND t.st = 'a'
+       LIMIT 1`,
+      [last9]
+    );
+    if (tRes.rows.length) {
+      const t = tRes.rows[0];
+      const leaderTxt = t.leader_class_name ? `\nSinf rahbari: ${t.leader_class_name}` : '';
+      return {
+        found: true,
+        role: 'teacher',
+        name: t.name,
+        teacherId: t.id,
+        schoolId: t.school_id,
+        schoolName: t.school_name,
+        message: `Assalomu alaykum, Hurmatli ${t.name}! 👨‍🏫\n\nMaktab: «${t.school_name}»\nLavozimingiz: O'qituvchi (${t.position || "Fan o'qituvchisi"})${leaderTxt}\n\nQuyidagi menyu orqali darslaringiz va davomatni boshqarishingiz mumkin:`,
+      };
+    }
+
+    // 4. Ota-ona / O'quvchi tekshirish
+    const stRes = await db.query(
+      `SELECT s.id, s.name as student_name, s.parent_name, s.school_id, c.name as class_name, sch.name as school_name
+       FROM students s
+       JOIN classes c ON s.class_id = c.id
+       JOIN schools sch ON sch.id = s.school_id
+       WHERE (replace(replace(replace(replace(s.parent_phone, ' ', ''), '-', ''), '(', ''), ')', '') LIKE '%' || $1
+          OR replace(replace(replace(replace(s.phone, ' ', ''), '-', ''), '(', ''), ')', '') LIKE '%' || $1)
+         AND s.st = 'a'
+       LIMIT 1`,
+      [last9]
+    );
+    if (stRes.rows.length) {
+      const st = stRes.rows[0];
+      // Kontaktni ulash
+      await db.query(
+        `INSERT INTO parent_contacts (school_id, student_id, phone, telegram_chat_id, status, consent_at)
+         VALUES ($1, $2, $3, $4, 'connected', NOW())
+         ON CONFLICT DO NOTHING`,
+        [st.school_id, st.id, normalized, chatId]
+      );
+      await db.query(
+        `UPDATE parent_contacts
+         SET status = 'connected', telegram_chat_id = $1, consent_at = NOW()
+         WHERE student_id = $2`,
+        [chatId, st.id]
+      );
+
+      return {
+        found: true,
+        role: 'parent',
+        name: st.parent_name || 'Hurmatli Ota-ona',
+        studentId: st.id,
+        schoolId: st.school_id,
+        schoolName: st.school_name,
+        className: st.class_name,
+        message: `Assalomu alaykum, ${st.parent_name || 'Hurmatli ota-ona'}! 👨‍👩‍👦\n\nFarzandingiz: ${st.student_name}\nSinfi: ${st.class_name} («${st.school_name}»)\n\nFarzandingizning davomat ma'lumotlari ushbu botga avtomatik yuborib turiladi.`,
+      };
+    }
+
+    // 5. Topilmasa
+    return {
+      found: false,
+      message: `Kechirasiz, sizning telefon raqamingiz (${normalized}) maktab tizimida ro'yxatga olinmagan ❌\n\nIltimos, maktab ma'muriyatiga murojaat qiling va raqamingizni kiritishlarini so'rang.`,
+    };
+  }
+
+  /**
+   * O'qituvchining bugungi darslarini olish
+   */
+  static async getTeacherTodayLessons(db: DbClient, teacherId: number): Promise<string> {
+    const today = new Date().toISOString().split('T')[0];
+    const dateObj = new Date(today + 'T12:00:00Z');
+    const dayOfWeek = (dateObj.getUTCDay() + 6) % 7;
+
+    const res = await db.query(
+      `SELECT ss.slot_no, sub.name as subject_name, c.name as class_name
+       FROM schedule_slots ss
+       JOIN assignments a ON ss.assignment_id = a.id
+       JOIN subjects sub ON a.subject_id = sub.id
+       JOIN classes c ON a.class_id = c.id
+       WHERE a.teacher_id = $1 AND ss.day = $2
+       ORDER BY ss.slot_no ASC`,
+      [teacherId, dayOfWeek]
+    );
+
+    if (!res.rows.length) {
+      return `📅 Bugun sizda darslar jadvalga qo'yilmagan yoki dam olish kuni.`;
+    }
+
+    const lines = [`📅 Bugungi darslaringiz (${formatUzDate(today)}):`];
+    for (const r of res.rows) {
+      lines.push(`⏰ ${r.slot_no + 1}-dars: ${r.subject_name} (${r.class_name})`);
+    }
+    return lines.join('\n');
+  }
+
+  /**
+   * Ota-ona uchun: farzandining bugungi davomatini olish
+   */
+  static async getStudentTodayAttendance(db: DbClient, studentId: number): Promise<string> {
+    const today = new Date().toISOString().split('T')[0];
+    const res = await db.query(
+      `SELECT ar.status, ses.slot_no, sub.name as subject_name, st.name as student_name, c.name as class_name
+       FROM attendance_records ar
+       JOIN attendance_sessions ses ON ar.session_id = ses.id
+       JOIN subjects sub ON ses.subject_id = sub.id
+       JOIN students st ON ar.student_id = st.id
+       JOIN classes c ON st.class_id = c.id
+       WHERE ar.student_id = $1 AND ses.date = $2
+       ORDER BY ses.slot_no ASC`,
+      [studentId, today]
+    );
+
+    if (!res.rows.length) {
+      return `ℹ️ Bugun (${formatUzDate(today)}) uchun hali davomat olinmagan.`;
+    }
+
+    const st = res.rows[0];
+    const records = res.rows.map((r) => ({
+      slot_number: r.slot_no,
+      subject_name: r.subject_name,
+      status: r.status,
+    }));
+
+    return composeAttendanceNotification(st.student_name, st.class_name, today, records);
+  }
+
+  /**
+   * Ota-ona uchun: farzandining davomat statistikasi
+   */
+  static async getStudentMonthlyStats(db: DbClient, studentId: number): Promise<string> {
+    const res = await db.query(
+      `SELECT ar.status, count(*) as count
+       FROM attendance_records ar
+       WHERE ar.student_id = $1
+       GROUP BY ar.status`,
+      [studentId]
+    );
+
+    if (!res.rows.length) {
+      return `📊 Farzandingiz bo'yicha hali davomat yozuvlari mavjud emas.`;
+    }
+
+    let p = 0, a = 0, l = 0, e = 0;
+    for (const r of res.rows) {
+      const cnt = parseInt(r.count, 10);
+      if (r.status === 'p') p = cnt;
+      if (r.status === 'a') a = cnt;
+      if (r.status === 'l') l = cnt;
+      if (r.status === 'e') e = cnt;
+    }
+
+    const total = p + a + l + e;
+    const pct = total > 0 ? Math.round(((total - a) / total) * 100) : 100;
+
+    return (
+      `📊 Davomat statistikasi:\n\n` +
+      `📈 Umumiy qatnashish ko'rsatkichi: ${pct}%\n` +
+      `✅ Qatnashgan darslar: ${p + l + e} ta\n` +
+      `⏰ Kechikishlar: ${l} ta\n` +
+      `ℹ️ Sababli qoldirilgan: ${e} ta\n` +
+      `❌ Sababsiz qoldirilgan: ${a} ta\n` +
+      `📚 Jami darslar: ${total} ta`
+    );
+  }
+
+  /**
+   * Direktor uchun: maktabning bugungi umumiy davomat statistikasi
+   */
+  static async getSchoolTodayStats(db: DbClient, schoolId: number): Promise<string> {
+    const today = new Date().toISOString().split('T')[0];
+    const res = await db.query(
+      `SELECT ar.status, count(*) as count
+       FROM attendance_records ar
+       JOIN attendance_sessions ses ON ar.session_id = ses.id
+       WHERE ses.school_id = $1 AND ses.date = $2
+       GROUP BY ar.status`,
+      [schoolId, today]
+    );
+
+    if (!res.rows.length) {
+      return `📊 Bugun (${formatUzDate(today)}) maktabda hali darslar bo'yicha davomat saqlanmagan.`;
+    }
+
+    let p = 0, a = 0, l = 0, e = 0;
+    for (const r of res.rows) {
+      const cnt = parseInt(r.count, 10);
+      if (r.status === 'p') p = cnt;
+      if (r.status === 'a') a = cnt;
+      if (r.status === 'l') l = cnt;
+      if (r.status === 'e') e = cnt;
+    }
+
+    const total = p + a + l + e;
+    const pct = total > 0 ? Math.round(((total - a) / total) * 100) : 100;
+
+    return (
+      `🏫 Bugungi maktab davomati (${formatUzDate(today)}):\n\n` +
+      `📈 Umumiy davomat ko'rsatkichi: ${pct}%\n` +
+      `✅ Darsda qatnashganlar: ${p + l + e} kishi/dars\n` +
+      `❌ Kelmaganlar: ${a} kishi/dars\n` +
+      `⏰ Kechikkanlar: ${l} kishi/dars\n` +
+      `ℹ️ Sabablilar: ${e} kishi/dars\n` +
+      `📚 Jami qaydlar: ${total} ta`
+    );
+  }
+
+  /**
    * Kunlik davomat xabarlarini outbox navbatiga yozish
    */
   static async queueDailyMessages(
