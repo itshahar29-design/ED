@@ -559,7 +559,9 @@ export function initBot(db: DbClient): Bot | null {
 
   // Boshqaruv: Telefon raqamni biriktirish
   bot.callbackQuery('manage_link_phone', async (ctx) => {
-    userSessions.delete(ctx.chat.id);
+    if (ctx.chat) {
+      userSessions.delete(ctx.chat.id);
+    }
     const phoneKb = new Keyboard()
       .requestContact('📱 Telefon raqamni yuborish')
       .resized()
