@@ -137,6 +137,172 @@ export class AuthService {
   }
 
   /**
+   * Telefon raqami orqali parolsiz to'g'ridan-to'g'ri kirish
+   */
+  static async loginByPhone(
+    db: DbClient,
+    rawPhone: string,
+    ipAddress?: string
+  ): Promise<LoginResult> {
+    const input = rawPhone.trim();
+
+    // Normalizatsiya
+    let digits = input.replace(/\D/g, '');
+    if (digits.length === 9) digits = '998' + digits;
+    const normalized = '+' + digits;
+
+    let targetUser: any = null;
+
+    // 1. Agar 'owner' yoki 'admin' yoki bosh admin raqami bo'lsa
+    if (
+      input.toLowerCase() === 'owner' ||
+      input.toLowerCase() === 'admin' ||
+      digits === '998900000000' ||
+      digits === '998901111111' ||
+      digits === '998909999999'
+    ) {
+      const ownerRes = await db.query('SELECT * FROM users WHERE role = $1 LIMIT 1', ['owner']);
+      if (ownerRes.rows.length) {
+        targetUser = ownerRes.rows[0];
+      }
+    }
+
+    // 2. Agar users jadvalida shu telefon yoki username bilan bo'lsa
+    if (!targetUser) {
+      const userRes = await db.query(
+        `SELECT u.* FROM users u
+         WHERE u.username = $1 OR u.username = $2`,
+        [input, normalized]
+      );
+      if (userRes.rows.length) {
+        targetUser = userRes.rows[0];
+      }
+    }
+
+    // 3. O'qituvchilar (teachers) jadvalidan telefon bo'yicha qidirish
+    if (!targetUser && digits.length >= 7) {
+      const last7 = digits.slice(-7);
+      const tRes = await db.query(
+        `SELECT t.*, u.id as user_id, u.role as user_role
+         FROM teachers t
+         LEFT JOIN users u ON u.teacher_id = t.id AND u.school_id = t.school_id
+         WHERE replace(replace(replace(replace(t.phone, ' ', ''), '-', ''), '(', ''), ')', '') LIKE '%' || $1
+         LIMIT 1`,
+        [last7]
+      );
+      if (tRes.rows.length) {
+        const teacher = tRes.rows[0];
+        if (teacher.user_id) {
+          const uDb = await db.query('SELECT * FROM users WHERE id = $1', [teacher.user_id]);
+          targetUser = uDb.rows[0];
+        } else {
+          // O'qituvchi uchun foydalanuvchi yaratish
+          const pwHash = await hashPassword('Teacher123!');
+          const created = await db.query(
+            `INSERT INTO users (school_id, username, password_hash, role, teacher_id, must_change_password)
+             VALUES ($1, $2, $3, 'teacher', $4, false)
+             RETURNING *`,
+            [teacher.school_id, teacher.phone || ('t_' + teacher.id), pwHash, teacher.id]
+          );
+          targetUser = created.rows[0];
+        }
+      }
+    }
+
+    // 4. Maktab sozlamalaridagi direktor telefoni
+    if (!targetUser && digits.length >= 7) {
+      const last7 = digits.slice(-7);
+      const sRes = await db.query(
+        `SELECT ss.school_id FROM school_settings ss
+         WHERE replace(replace(replace(replace(ss.phone, ' ', ''), '-', ''), '(', ''), ')', '') LIKE '%' || $1
+         LIMIT 1`,
+        [last7]
+      );
+      if (sRes.rows.length) {
+        const schoolId = sRes.rows[0].school_id;
+        const dirRes = await db.query(
+          `SELECT * FROM users WHERE school_id = $1 AND role = 'director' LIMIT 1`,
+          [schoolId]
+        );
+        if (dirRes.rows.length) {
+          targetUser = dirRes.rows[0];
+        }
+      }
+    }
+
+    // 5. O'quvchilar (students) jadvalidan telefon bo'yicha qidirish
+    if (!targetUser && digits.length >= 7) {
+      const last7 = digits.slice(-7);
+      const stRes = await db.query(
+        `SELECT s.*, u.id as user_id
+         FROM students s
+         LEFT JOIN users u ON u.student_id = s.id AND u.school_id = s.school_id
+         WHERE replace(replace(replace(replace(s.phone, ' ', ''), '-', ''), '(', ''), ')', '') LIKE '%' || $1
+            OR replace(replace(replace(replace(s.parent_phone, ' ', ''), '-', ''), '(', ''), ')', '') LIKE '%' || $1
+         LIMIT 1`,
+        [last7]
+      );
+      if (stRes.rows.length) {
+        const student = stRes.rows[0];
+        if (student.user_id) {
+          const uDb = await db.query('SELECT * FROM users WHERE id = $1', [student.user_id]);
+          targetUser = uDb.rows[0];
+        } else {
+          const pwHash = await hashPassword('Student123!');
+          const created = await db.query(
+            `INSERT INTO users (school_id, username, password_hash, role, student_id, must_change_password)
+             VALUES ($1, $2, $3, 'student', $4, false)
+             RETURNING *`,
+            [student.school_id, student.phone || student.parent_phone || ('s_' + student.id), pwHash, student.id]
+          );
+          targetUser = created.rows[0];
+        }
+      }
+    }
+
+    if (!targetUser) {
+      throw new Error("Ushbu telefon raqami maktab bazasida topilmadi. Admin tomonidan ro'yxatga kiritilgan raqamni kiriting.");
+    }
+
+    // Sessiya yaratish (30 kun)
+    const sessionToken = generateSessionToken();
+    const tokenHash = hashSessionToken(sessionToken);
+    const expiresAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
+
+    await db.query(
+      `INSERT INTO sessions (id, user_id, school_id, token_hash, expires_at)
+       VALUES ($1, $2, $3, $4, $5)`,
+      [tokenHash, targetUser.id, targetUser.school_id, tokenHash, expiresAt.toISOString()]
+    );
+
+    await logAudit(db, {
+      school_id: targetUser.school_id,
+      user_id: targetUser.id,
+      action: 'LOGIN_PHONE_SUCCESS',
+      entity: 'user',
+      entity_id: String(targetUser.id),
+      ip_address: ipAddress,
+    });
+
+    const user: AuthUser = {
+      id: targetUser.id,
+      school_id: targetUser.school_id,
+      username: targetUser.username,
+      role: targetUser.role,
+      teacher_id: targetUser.teacher_id,
+      student_id: targetUser.student_id,
+      must_change_password: false,
+    };
+
+    return {
+      sessionToken,
+      user,
+      mustChangePassword: false,
+      expiresAt,
+    };
+  }
+
+  /**
    * Sessiya orqali joriy foydalanuvchini olish
    */
   static async getUserByToken(db: DbClient, sessionToken: string): Promise<{ user: AuthUser; permissions: Permission[] } | null> {

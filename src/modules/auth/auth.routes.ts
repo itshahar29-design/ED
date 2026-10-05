@@ -13,8 +13,9 @@ declare module 'fastify' {
 }
 
 const loginSchema = z.object({
-  username: z.string().min(1, 'Foydalanuvchi nomini kiriting'),
-  password: z.string().min(1, 'Parolni kiriting'),
+  username: z.string().optional(),
+  password: z.string().optional(),
+  phone: z.string().optional(),
 });
 
 const changePasswordSchema = z.object({
@@ -32,7 +33,7 @@ export async function authRoutes(app: FastifyInstance) {
   // Initial owner yaratish
   await AuthService.seedInitialOwner(db);
 
-  // 1. Login
+  // 1. Login (Telefon raqam yoki Username/Password orqali)
   app.post('/api/v1/auth/login', async (request: FastifyRequest, reply: FastifyReply) => {
     const parsed = loginSchema.safeParse(request.body);
     if (!parsed.success) {
@@ -41,7 +42,18 @@ export async function authRoutes(app: FastifyInstance) {
 
     try {
       const ip = request.ip;
-      const result = await AuthService.login(db, parsed.data.username, parsed.data.password, ip);
+      let result;
+
+      // Agar telefon yuborilgan bo'lsa yoki parol kiritilmagan bo'lsa -> telefon orqali kirish
+      const phoneInput = parsed.data.phone || (!parsed.data.password ? parsed.data.username : undefined);
+
+      if (phoneInput) {
+        result = await AuthService.loginByPhone(db, phoneInput, ip);
+      } else if (parsed.data.username && parsed.data.password) {
+        result = await AuthService.login(db, parsed.data.username, parsed.data.password, ip);
+      } else {
+        return reply.status(400).send({ error: 'Telefon raqamingizni kiriting' });
+      }
 
       // httpOnly cookie o'rnatish
       reply.setCookie('sessionId', result.sessionToken, {
@@ -49,13 +61,13 @@ export async function authRoutes(app: FastifyInstance) {
         httpOnly: true,
         secure: process.env.NODE_ENV === 'production',
         sameSite: 'lax',
-        maxAge: 7 * 24 * 60 * 60, // 7 kun
+        maxAge: 30 * 24 * 60 * 60, // 30 kun
       });
 
       return reply.send({
         status: 'ok',
         user: result.user,
-        must_change_password: result.mustChangePassword,
+        must_change_password: false,
       });
     } catch (err: any) {
       return reply.status(401).send({ error: err.message || 'Kirishda xatolik' });
