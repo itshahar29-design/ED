@@ -4,6 +4,7 @@ import { BootstrapService } from './bootstrap.service.js';
 import { AuthService } from '../auth/auth.service.js';
 import { can, ALL_PERMISSIONS } from '../auth/permissions.js';
 import { DbClient } from '../../db/client.js';
+import { seedXatirchiSchool } from '../school/xatirchi.seed.js';
 
 async function getAuth(request: FastifyRequest, db: DbClient) {
   const token = request.cookies.sessionId || request.headers.authorization?.replace('Bearer ', '');
@@ -310,6 +311,21 @@ export async function bootstrapRoutes(app: FastifyInstance) {
         parsed.data.director_phone,
         request.ip
       );
+      return reply.send({ status: 'ok', data: result });
+    } catch (err: any) {
+      return reply.status(400).send({ error: err.message });
+    }
+  });
+
+  // 9. Xatirchi tumani 65-maktabni tayyor rollar va sinflar bilan qayta sozlash
+  app.post('/api/v1/owner/seed-xatirchi', async (request: FastifyRequest, reply: FastifyReply) => {
+    const auth = await getAuth(request, db);
+    if (!auth || auth.user.role !== 'owner') {
+      return reply.status(403).send({ error: 'Faqat platforma egasi (owner) uchun' });
+    }
+
+    try {
+      const result = await seedXatirchiSchool(db);
       return reply.send({ status: 'ok', data: result });
     } catch (err: any) {
       return reply.status(400).send({ error: err.message });

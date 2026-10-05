@@ -357,8 +357,8 @@ export class TelegramService {
       `SELECT t.id, t.name, t.school_id, t.position, s.name as school_name, c.name as leader_class_name
        FROM teachers t
        JOIN schools s ON s.id = t.school_id
-       LEFT JOIN classes c ON c.leader_teacher_id = t.id AND c.st = 'a'
-       WHERE replace(replace(replace(replace(t.phone, ' ', ''), '-', ''), '(', ''), ')', '') LIKE '%' || $1 AND t.st = 'a'
+       LEFT JOIN classes c ON c.leader_teacher_id = t.id AND c.status = 'a'
+       WHERE replace(replace(replace(replace(t.phone, ' ', ''), '-', ''), '(', ''), ')', '') LIKE '%' || $1 AND t.status = 'a'
        LIMIT 1`,
       [last9]
     );
@@ -384,7 +384,7 @@ export class TelegramService {
        JOIN schools sch ON sch.id = s.school_id
        WHERE (replace(replace(replace(replace(s.parent_phone, ' ', ''), '-', ''), '(', ''), ')', '') LIKE '%' || $1
           OR replace(replace(replace(replace(s.phone, ' ', ''), '-', ''), '(', ''), ')', '') LIKE '%' || $1)
-         AND s.st = 'a'
+         AND s.status = 'a'
        LIMIT 1`,
       [last9]
     );

@@ -8,6 +8,7 @@ import {
 } from './crypto.js';
 import { AuthUser, DEFAULT_ROLE_PERMISSIONS, Permission } from './permissions.js';
 import { logAudit } from '../audit/audit.service.js';
+import { seedXatirchiSchool } from '../school/xatirchi.seed.js';
 
 export interface LoginResult {
   sessionToken: string;
@@ -18,7 +19,7 @@ export interface LoginResult {
 
 export class AuthService {
   /**
-   * Tizimda kamida bitta owner bo'lishini ta'minlash
+   * Tizimda kamida bitta owner bo'lishini ta'minlash va 65-maktabni tayyorlash
    */
   static async seedInitialOwner(db: DbClient): Promise<void> {
     const ownerRes = await db.query('SELECT id FROM users WHERE role = $1 LIMIT 1', ['owner']);
@@ -30,6 +31,12 @@ export class AuthService {
         ['owner', pwHash, 'owner', false]
       );
       console.log('Default owner yaratildi: username="owner", parol="Owner123456!"');
+    }
+
+    try {
+      await seedXatirchiSchool(db);
+    } catch (e: any) {
+      console.warn('Xatirchi 65-maktab seed ogohlantirish:', e.message);
     }
   }
 
