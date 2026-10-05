@@ -1,0 +1,30 @@
+services:
+  - type: web
+    name: edumemory
+    runtime: node
+    plan: free
+    buildCommand: npm install && npm run build
+    startCommand: npm start
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 10000
+      - key: HOST
+        value: 0.0.0.0
+      - key: TIMEZONE
+        value: Asia/Tashkent
+      - key: COOKIE_SECRET
+        generateValue: true
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_BOT_USERNAME
+        value: EduMemoryBot
+      - key: DATABASE_URL
+        fromDatabase:
+          name: edumemory-db
+          property: connectionString
+
+databases:
+  - name: edumemory-db
+    plan: free

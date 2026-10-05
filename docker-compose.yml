@@ -1,0 +1,42 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: edumemory_postgres
+    restart: always
+    environment:
+      POSTGRES_USER: ${DB_USER:-edumemory}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-edumemory123}
+      POSTGRES_DB: ${DB_NAME:-edumemory}
+    ports:
+      - "${DB_PORT:-5432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-edumemory} -d ${DB_NAME:-edumemory}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: edumemory_app
+    restart: always
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "${PORT:-3000}:3000"
+    environment:
+      NODE_ENV: ${NODE_ENV:-production}
+      PORT: ${PORT:-3000}
+      HOST: 0.0.0.0
+      DATABASE_URL: postgres://${DB_USER:-edumemory}:${DB_PASSWORD:-edumemory123}@postgres:5432/${DB_NAME:-edumemory}
+      COOKIE_SECRET: ${COOKIE_SECRET:-edumemory_super_secure_random_cookie_secret_key_32_chars_long}
+      TIMEZONE: ${TIMEZONE:-Asia/Tashkent}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_BOT_USERNAME: ${TELEGRAM_BOT_USERNAME:-}
+
+volumes:
+  pgdata:
