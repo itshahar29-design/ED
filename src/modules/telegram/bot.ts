@@ -19,14 +19,41 @@ function getWebAppUrl(): string {
 }
 
 /**
- * Asosiy klaviatura — Foydalanuvchi rasmdagi kabi:
- * 1-qator: 🌐 Sayt orqali davomat (Web App)
- * 2-qator: 📋 Davomat
- * 3-qator: 👥 O'quvchilar | ➕ O'quvchi qo'shish
- * 4-qator: 🛠 Boshqarish
+ * Foydalanuvchi lavozimiga mos menyu klaviaturasi:
+ * - Owner / Director: Sayt orqali davomat, Davomat, O'quvchilar, O'quvchi qo'shish, Boshqarish, Chiqish
+ * - Teacher: Bugungi darslarim, Davomat holati, Davomat, O'quvchilar, Sayt havolasi, Chiqish
+ * - Parent: Bugungi davomat, Oylik hisobot, Sayt havolasi, Chiqish
  */
-export function getMainMenuKeyboard(): Keyboard {
+export function getRoleKeyboard(user: any): Keyboard {
   const webAppUrl = getWebAppUrl();
+  const role = user?.role;
+
+  if (role === 'teacher') {
+    return new Keyboard()
+      .text('📋 Bugungi darslarim')
+      .text('⚡ Davomat holati')
+      .row()
+      .text('📋 Davomat')
+      .text("👥 O'quvchilar")
+      .row()
+      .webApp('🌐 Sayt orqali davomat (Web App)', webAppUrl)
+      .row()
+      .text('🔄 Chiqish / Raqamni almashtirish')
+      .resized();
+  }
+
+  if (role === 'parent') {
+    return new Keyboard()
+      .text('📅 Bugungi davomat')
+      .text('📊 Oylik hisobot')
+      .row()
+      .webApp('🌐 Sayt orqali davomat (Web App)', webAppUrl)
+      .row()
+      .text('🔄 Chiqish / Raqamni almashtirish')
+      .resized();
+  }
+
+  // Owner yoki Director uchun to'liq menyu
   return new Keyboard()
     .webApp('🌐 Sayt orqali davomat (Web App)', webAppUrl)
     .row()
@@ -36,6 +63,8 @@ export function getMainMenuKeyboard(): Keyboard {
     .text("➕ O'quvchi qo'shish")
     .row()
     .text('🛠 Boshqarish')
+    .row()
+    .text('🔄 Chiqish / Raqamni almashtirish')
     .resized();
 }
 
@@ -48,11 +77,11 @@ async function getOrCreateDefaultSchoolId(db: DbClient): Promise<number> {
     return schRes.rows[0].id;
   }
   const ins = await db.query(
-    "INSERT INTO schools (name, code, status) VALUES ('EduMemory Maktab', 'SCH01', 'active') RETURNING id"
+    "INSERT INTO schools (name, code, status) VALUES ('Xatirchi tumani 65-maktab', 'XATIRCHI-65', 'active') RETURNING id"
   );
   const id = ins.rows[0].id;
   await db.query(
-    "INSERT INTO school_settings (school_id, name, phone, logo) VALUES ($1, 'EduMemory Maktab', '+998901234567', '🎓') ON CONFLICT DO NOTHING",
+    "INSERT INTO school_settings (school_id, name, phone, logo) VALUES ($1, 'Xatirchi tumani 65-maktab', '+998901234567', '🏫') ON CONFLICT DO NOTHING",
     [id]
   );
   await db.query(
@@ -106,7 +135,25 @@ export function initBot(db: DbClient): Bot | null {
       console.warn('Bot buyruqlarini sozlashda ogohlantirish:', err.message);
     });
 
-  // /start buyrug'i
+  // Foydalanuvchi tizimga kirganligini tekshirish yordamchisi
+  const ensureAuth = async (ctx: any): Promise<any | null> => {
+    if (!ctx.chat) return null;
+    const user = userSessions.get(ctx.chat.id);
+    if (!user || !user.found) {
+      const phoneKb = new Keyboard()
+        .requestContact('📱 Telefon raqamni yuborish')
+        .resized()
+        .oneTime();
+      await ctx.reply(
+        "Iltimos, avval tizimda kim ekanligingizni aniqlash uchun telefon raqamingizni yuboring 👇",
+        { reply_markup: phoneKb }
+      );
+      return null;
+    }
+    return user;
+  };
+
+  // /start buyrug'i — Kirish bosqichi
   bot.command('start', async (ctx) => {
     userState.delete(ctx.chat.id);
     const code = ctx.match?.trim();
@@ -123,12 +170,12 @@ export function initBot(db: DbClient): Bot | null {
         await ctx.reply(res.text, { reply_markup: kb });
         return;
       } else {
-        await ctx.reply(res.text, { reply_markup: getMainMenuKeyboard() });
+        await ctx.reply(res.text);
         return;
       }
     }
 
-    // 2. Foydalanuvchi avval tanilgan bo'lsa
+    // 2. Agar foydalanuvchi allaqachon raqamini tasdiqlagan bo'lsa
     const existing = userSessions.get(ctx.chat.id);
     if (existing && existing.found) {
       const roleName =
@@ -137,34 +184,123 @@ export function initBot(db: DbClient): Bot | null {
           : existing.role === 'director'
           ? 'Maktab Direktori 🏫'
           : existing.role === 'owner'
-          ? 'Administrator 👑'
+          ? 'Platforma Rahbari (Owner) 👑'
           : 'Ota-ona 👨‍👩‍👦';
 
       await ctx.reply(
         `Xush kelibsiz, ${existing.name}! 👋\nLavozimingiz: ${roleName}\n\nQuyidagi menyudan kerakli bo'limni tanlang 👇`,
-        { reply_markup: getMainMenuKeyboard() }
+        { reply_markup: getRoleKeyboard(existing) }
       );
       return;
     }
 
-    // 3. Umumiy boshlang'ich xabar
+    // 3. Yangi tashrif: MENYU CHIQARMAYMIZ — FAQAT TELEFON RAQAMNI SO'RAYMIZ!
+    const phoneKb = new Keyboard()
+      .requestContact('📱 Telefon raqamni yuborish')
+      .resized()
+      .oneTime();
+
     await ctx.reply(
-      `Assalomu alaykum! 🎓 EduMemory maktab davomat tizimi botiga xush kelibsiz.\n\n` +
-      `Quyidagi tugmalar orqali davomat olish, o'quvchilarni ko'rish yoki yangi o'quvchi qo'shishingiz mumkin 👇`,
-      { reply_markup: getMainMenuKeyboard() }
+      "Assalomu alaykum! 🎓 EduMemory maktab davomat tizimi botiga xush kelibsiz.\n\n" +
+      "Tizimda lavozimingizni (Direktor, O'qituvchi, Ota-ona yoki Administrator) aniqlash va menyuni ochish uchun, iltimos, telefon raqamingizni yuboring 👇",
+      { reply_markup: phoneKb }
     );
   });
 
   // /menu buyrug'i
   bot.command('menu', async (ctx) => {
     userState.delete(ctx.chat.id);
-    await ctx.reply("Asosiy menyu:", { reply_markup: getMainMenuKeyboard() });
+    const user = await ensureAuth(ctx);
+    if (!user) return;
+    await ctx.reply("Asosiy menyu:", { reply_markup: getRoleKeyboard(user) });
+  });
+
+  // -------------------------------------------------------------
+  // Kontakt yuborilganda (Telegram Contact)
+  // -------------------------------------------------------------
+  bot.on(':contact', async (ctx) => {
+    const contact = ctx.message?.contact;
+    if (!contact) return;
+
+    // A. Taklif kodi bo'lsa
+    const code = userPendingCode.get(ctx.chat.id);
+    if (code) {
+      const res = await TelegramService.verifyContact(
+        db,
+        code,
+        ctx.chat.id,
+        contact.phone_number
+      );
+      userPendingCode.delete(ctx.chat.id);
+      await ctx.reply(res.message, { reply_markup: { remove_keyboard: true } });
+      return;
+    }
+
+    // B. Umumiy kirish: Raqam bo'yicha lavozimni aniqlash
+    const identified = await TelegramService.identifyUserByPhone(
+      db,
+      contact.phone_number,
+      ctx.chat.id
+    );
+
+    if (identified.found) {
+      userSessions.set(ctx.chat.id, identified);
+      await ctx.reply(identified.message, {
+        reply_markup: getRoleKeyboard(identified),
+      });
+    } else {
+      const retryKb = new Keyboard()
+        .requestContact('📱 Boshqa raqam yuborish')
+        .resized()
+        .oneTime();
+
+      await ctx.reply(
+        `Kechirasiz, sizning telefon raqamingiz (${normalizePhone(contact.phone_number)}) maktab tizimida ro'yxatga olinmagan ❌\n\n` +
+        `Iltimos, maktab ma'muriyatiga murojaat qiling va raqamingizni kiritishlarini so'rang.`,
+        { reply_markup: retryKb }
+      );
+    }
+  });
+
+  // -------------------------------------------------------------
+  // Telefon raqam matn ko'rinishida yozilganda (+998996893228 yoki 996893228)
+  // -------------------------------------------------------------
+  bot.hears(/^(\+?998\d{9}|\d{9})$/, async (ctx) => {
+    const text = ctx.message?.text || '';
+    const raw = text.trim().replace(/\s+/g, '');
+    if (!raw) return;
+    const identified = await TelegramService.identifyUserByPhone(
+      db,
+      raw,
+      ctx.chat.id
+    );
+
+    if (identified.found) {
+      userSessions.set(ctx.chat.id, identified);
+      await ctx.reply(identified.message, {
+        reply_markup: getRoleKeyboard(identified),
+      });
+    } else {
+      const retryKb = new Keyboard()
+        .requestContact('📱 Boshqa raqam yuborish')
+        .resized()
+        .oneTime();
+
+      await ctx.reply(
+        `Kechirasiz, sizning telefon raqamingiz (${normalizePhone(raw)}) maktab tizimida ro'yxatga olinmagan ❌\n\n` +
+        `Iltimos, maktab ma'muriyatiga murojaat qiling va raqamingizni kiritishlarini so'rang.`,
+        { reply_markup: retryKb }
+      );
+    }
   });
 
   // -------------------------------------------------------------
   // 1. 🌐 Sayt orqali davomat (Web App)
   // -------------------------------------------------------------
   bot.hears(/🌐? ?Sayt orqali davomat/i, async (ctx) => {
+    const user = await ensureAuth(ctx);
+    if (!user) return;
+
     const webAppUrl = getWebAppUrl();
     const inline = new InlineKeyboard()
       .webApp('🌐 Web App ni ochish', webAppUrl)
@@ -183,8 +319,11 @@ export function initBot(db: DbClient): Bot | null {
   // -------------------------------------------------------------
   const handleDavomat = async (ctx: any) => {
     userState.delete(ctx.chat.id);
+    const user = await ensureAuth(ctx);
+    if (!user) return;
+
     const webAppUrl = getWebAppUrl();
-    const schoolId = await getOrCreateDefaultSchoolId(db);
+    const schoolId = user.schoolId || (await getOrCreateDefaultSchoolId(db));
 
     const cRes = await db.query(
       `SELECT c.id, c.name, COUNT(s.id) as student_count
@@ -229,7 +368,7 @@ export function initBot(db: DbClient): Bot | null {
     );
   };
 
-  bot.hears(/📋? ?Davomat/i, handleDavomat);
+  bot.hears(/📋? ?Davomat$/i, handleDavomat);
   bot.command('davomat', handleDavomat);
 
   // -------------------------------------------------------------
@@ -237,7 +376,10 @@ export function initBot(db: DbClient): Bot | null {
   // -------------------------------------------------------------
   const handleStudents = async (ctx: any) => {
     userState.delete(ctx.chat.id);
-    const schoolId = await getOrCreateDefaultSchoolId(db);
+    const user = await ensureAuth(ctx);
+    if (!user) return;
+
+    const schoolId = user.schoolId || (await getOrCreateDefaultSchoolId(db));
 
     const sRes = await db.query(
       `SELECT s.id, s.name, s.phone, s.parent_phone, c.name as class_name
@@ -291,6 +433,9 @@ export function initBot(db: DbClient): Bot | null {
   // 4. ➕ O'quvchi qo'shish (Tugma: "➕ O'quvchi qo'shish" yoki /add_student)
   // -------------------------------------------------------------
   const handleAddStudentPrompt = async (ctx: any) => {
+    const user = await ensureAuth(ctx);
+    if (!user) return;
+
     userState.set(ctx.chat.id, { step: 'adding_student' });
     await ctx.reply(
       `➕ Yangi o'quvchi qo'shish\n\n` +
@@ -309,7 +454,13 @@ export function initBot(db: DbClient): Bot | null {
   // /cancel buyrug'i
   bot.command('cancel', async (ctx) => {
     userState.delete(ctx.chat.id);
-    await ctx.reply("❌ Amal bekor qilindi.", { reply_markup: getMainMenuKeyboard() });
+    const user = userSessions.get(ctx.chat.id);
+    if (user && user.found) {
+      await ctx.reply("❌ Amal bekor qilindi.", { reply_markup: getRoleKeyboard(user) });
+    } else {
+      const phoneKb = new Keyboard().requestContact('📱 Telefon raqamni yuborish').resized().oneTime();
+      await ctx.reply("❌ Amal bekor qilindi.", { reply_markup: phoneKb });
+    }
   });
 
   // -------------------------------------------------------------
@@ -317,6 +468,9 @@ export function initBot(db: DbClient): Bot | null {
   // -------------------------------------------------------------
   const handleManage = async (ctx: any) => {
     userState.delete(ctx.chat.id);
+    const user = await ensureAuth(ctx);
+    if (!user) return;
+
     const webAppUrl = getWebAppUrl();
 
     const inline = new InlineKeyboard()
@@ -326,7 +480,7 @@ export function initBot(db: DbClient): Bot | null {
       .text("👨‍🏫 O'qituvchilar", 'manage_teachers')
       .text("📊 Umumiy davomat", 'manage_school_stats')
       .row()
-      .text("📱 Telefon raqamni yangilash", 'manage_link_phone')
+      .text("📱 Raqamni almashtirish", 'manage_link_phone')
       .row()
       .webApp('🌐 EduMemory Web Panel', webAppUrl);
 
@@ -340,7 +494,80 @@ export function initBot(db: DbClient): Bot | null {
   bot.command(['admin', 'manage', 'boshqarish'], handleManage);
 
   // -------------------------------------------------------------
-  // Callback Query Handlers (Inline tugmalar uchun)
+  // O'qituvchi va Ota-ona maxsus bo'limlari
+  // -------------------------------------------------------------
+  bot.hears('📋 Bugungi darslarim', async (ctx) => {
+    const user = await ensureAuth(ctx);
+    if (!user) return;
+    if (user.role !== 'teacher' || !user.teacherId) {
+      await ctx.reply("Bu bo'lim faqat o'qituvchilar uchun.");
+      return;
+    }
+    const text = await TelegramService.getTeacherTodayLessons(db, user.teacherId);
+    await ctx.reply(text);
+  });
+
+  bot.hears('⚡ Davomat holati', async (ctx) => {
+    const user = await ensureAuth(ctx);
+    if (!user) return;
+    if (user.role !== 'teacher' || !user.teacherId) {
+      await ctx.reply("Bu bo'lim faqat o'qituvchilar uchun.");
+      return;
+    }
+    const text = await TelegramService.getTeacherTodayLessons(db, user.teacherId);
+    await ctx.reply(`${text}\n\nDavomatni belgilash uchun «📋 Davomat» tugmasidan foydalaning.`);
+  });
+
+  bot.hears('📅 Bugungi davomat', async (ctx) => {
+    const user = await ensureAuth(ctx);
+    if (!user) return;
+    if (user.role !== 'parent' || !user.studentId) {
+      await ctx.reply("Bu bo'lim faqat ota-onalar uchun.");
+      return;
+    }
+    const text = await TelegramService.getStudentTodayAttendance(db, user.studentId);
+    await ctx.reply(text);
+  });
+
+  bot.hears('📊 Oylik hisobot', async (ctx) => {
+    const user = await ensureAuth(ctx);
+    if (!user) return;
+    if (user.role !== 'parent' || !user.studentId) {
+      await ctx.reply("Bu bo'lim faqat ota-onalar uchun.");
+      return;
+    }
+    const text = await TelegramService.getStudentMonthlyStats(db, user.studentId);
+    await ctx.reply(text);
+  });
+
+  // -------------------------------------------------------------
+  // Chiqish / Raqamni almashtirish tugmasi
+  // -------------------------------------------------------------
+  bot.hears(/🔄? ?(Chiqish|Raqamni almashtirish)/i, async (ctx) => {
+    userSessions.delete(ctx.chat.id);
+    userPendingCode.delete(ctx.chat.id);
+    userState.delete(ctx.chat.id);
+    const phoneKb = new Keyboard()
+      .requestContact('📱 Telefon raqamni yuborish')
+      .resized()
+      .oneTime();
+    await ctx.reply(
+      "Tizimdan chiqildi. Boshqa telefon raqamingiz orqali kirish uchun pastdagi tugmani bosing 👇",
+      { reply_markup: phoneKb }
+    );
+  });
+
+  // /stop buyrug'i
+  bot.command('stop', async (ctx) => {
+    userSessions.delete(ctx.chat.id);
+    userPendingCode.delete(ctx.chat.id);
+    userState.delete(ctx.chat.id);
+    const res = await TelegramService.handleStop(db, ctx.chat.id);
+    await ctx.reply(res.message, { reply_markup: { remove_keyboard: true } });
+  });
+
+  // -------------------------------------------------------------
+  // Callback Query Handlers (Inline tugmalar)
   // -------------------------------------------------------------
   bot.callbackQuery('action_add_student', async (ctx) => {
     await ctx.answerCallbackQuery();
@@ -360,7 +587,8 @@ export function initBot(db: DbClient): Bot | null {
   // Sinf davomatini ko'rsatish
   bot.callbackQuery(/^davomat_class_(\d+)$/, async (ctx) => {
     const classId = parseInt(ctx.match[1], 10);
-    const schoolId = await getOrCreateDefaultSchoolId(db);
+    const user = ctx.chat ? userSessions.get(ctx.chat.id) : null;
+    const schoolId = user?.schoolId || (await getOrCreateDefaultSchoolId(db));
     const webAppUrl = getWebAppUrl();
 
     const cRes = await db.query(
@@ -412,7 +640,8 @@ export function initBot(db: DbClient): Bot | null {
   // "Hamma keldi" tugmasi bosilganda
   bot.callbackQuery(/^att_all_present_(\d+)$/, async (ctx) => {
     const classId = parseInt(ctx.match[1], 10);
-    const schoolId = await getOrCreateDefaultSchoolId(db);
+    const user = ctx.chat ? userSessions.get(ctx.chat.id) : null;
+    const schoolId = user?.schoolId || (await getOrCreateDefaultSchoolId(db));
     const today = new Date().toISOString().split('T')[0];
     const todayUz = formatUzDate(today);
 
@@ -423,7 +652,6 @@ export function initBot(db: DbClient): Bot | null {
       return;
     }
 
-    // Fan aniqlash yoki yaratish
     let subjectId = 1;
     const subRes = await db.query('SELECT id FROM subjects WHERE school_id = $1 LIMIT 1', [schoolId]);
     if (subRes.rows.length) {
@@ -436,7 +664,6 @@ export function initBot(db: DbClient): Bot | null {
       subjectId = insSub.rows[0].id;
     }
 
-    // O'qituvchi aniqlash yoki yaratish
     let teacherId = 1;
     const tRes = await db.query('SELECT id FROM teachers WHERE school_id = $1 LIMIT 1', [schoolId]);
     if (tRes.rows.length) {
@@ -449,7 +676,6 @@ export function initBot(db: DbClient): Bot | null {
       teacherId = insT.rows[0].id;
     }
 
-    // Davomat sessiyasi
     let sessionId: number;
     const sesRes = await db.query(
       'SELECT id FROM attendance_sessions WHERE school_id = $1 AND class_id = $2 AND date = $3 AND slot_no = 0 LIMIT 1',
@@ -466,7 +692,6 @@ export function initBot(db: DbClient): Bot | null {
       sessionId = insSes.rows[0].id;
     }
 
-    // Barcha o'quvchilarni 'p' (Keldi) deb yozish
     const sRes = await db.query(
       'SELECT id FROM students WHERE class_id = $1 AND status = \'a\'',
       [classId]
@@ -497,7 +722,9 @@ export function initBot(db: DbClient): Bot | null {
 
   // Boshqaruv: Sinflar ro'yxati
   bot.callbackQuery('manage_classes', async (ctx) => {
-    const schoolId = await getOrCreateDefaultSchoolId(db);
+    const user = ctx.chat ? userSessions.get(ctx.chat.id) : null;
+    const schoolId = user?.schoolId || (await getOrCreateDefaultSchoolId(db));
+
     const cRes = await db.query(
       `SELECT c.id, c.name, COUNT(s.id) as student_count
        FROM classes c
@@ -527,7 +754,9 @@ export function initBot(db: DbClient): Bot | null {
 
   // Boshqaruv: O'qituvchilar
   bot.callbackQuery('manage_teachers', async (ctx) => {
-    const schoolId = await getOrCreateDefaultSchoolId(db);
+    const user = ctx.chat ? userSessions.get(ctx.chat.id) : null;
+    const schoolId = user?.schoolId || (await getOrCreateDefaultSchoolId(db));
+
     const tRes = await db.query(
       `SELECT id, name, phone, position FROM teachers WHERE school_id = $1 AND status = 'a' ORDER BY name ASC`,
       [schoolId]
@@ -550,14 +779,15 @@ export function initBot(db: DbClient): Bot | null {
 
   // Boshqaruv: Maktab umumiy davomat statistikasi
   bot.callbackQuery('manage_school_stats', async (ctx) => {
-    const schoolId = await getOrCreateDefaultSchoolId(db);
+    const user = ctx.chat ? userSessions.get(ctx.chat.id) : null;
+    const schoolId = user?.schoolId || (await getOrCreateDefaultSchoolId(db));
     const statsText = await TelegramService.getSchoolTodayStats(db, schoolId);
     const inline = new InlineKeyboard().text("🔙 Boshqaruvga qaytish", 'manage_back');
     await ctx.editMessageText(statsText, { reply_markup: inline });
     await ctx.answerCallbackQuery();
   });
 
-  // Boshqaruv: Telefon raqamni biriktirish
+  // Boshqaruv: Telefon raqamni biriktirish / almashtirish
   bot.callbackQuery('manage_link_phone', async (ctx) => {
     if (ctx.chat) {
       userSessions.delete(ctx.chat.id);
@@ -584,7 +814,7 @@ export function initBot(db: DbClient): Bot | null {
       .text("👨‍🏫 O'qituvchilar", 'manage_teachers')
       .text("📊 Umumiy davomat", 'manage_school_stats')
       .row()
-      .text("📱 Telefon raqamni yangilash", 'manage_link_phone')
+      .text("📱 Raqamni almashtirish", 'manage_link_phone')
       .row()
       .webApp('🌐 EduMemory Web Panel', webAppUrl);
 
@@ -596,72 +826,7 @@ export function initBot(db: DbClient): Bot | null {
   });
 
   // -------------------------------------------------------------
-  // Kontakt yuborilganda (Telegram Contact)
-  // -------------------------------------------------------------
-  bot.on(':contact', async (ctx) => {
-    const contact = ctx.message?.contact;
-    if (!contact) return;
-
-    // A. Taklif kodi bo'lsa
-    const code = userPendingCode.get(ctx.chat.id);
-    if (code) {
-      const res = await TelegramService.verifyContact(
-        db,
-        code,
-        ctx.chat.id,
-        contact.phone_number
-      );
-      userPendingCode.delete(ctx.chat.id);
-      await ctx.reply(res.message, { reply_markup: getMainMenuKeyboard() });
-      return;
-    }
-
-    // B. Umumiy kirish: Raqam bo'yicha lavozimni aniqlash
-    const identified = await TelegramService.identifyUserByPhone(
-      db,
-      contact.phone_number,
-      ctx.chat.id
-    );
-
-    if (identified.found) {
-      userSessions.set(ctx.chat.id, identified);
-      await ctx.reply(identified.message, {
-        reply_markup: getMainMenuKeyboard(),
-      });
-    } else {
-      await ctx.reply(
-        `Telefon raqamingiz (${normalizePhone(contact.phone_number)}) qabul qilindi ✅\n` +
-        `Siz EduMemory botining barcha funksiyalaridan foydalanishingiz mumkin.`,
-        { reply_markup: getMainMenuKeyboard() }
-      );
-    }
-  });
-
-  // Raqamni almashtirish tugmasi
-  bot.hears('🔄 Raqamni almashtirish', async (ctx) => {
-    userSessions.delete(ctx.chat.id);
-    userPendingCode.delete(ctx.chat.id);
-    const phoneKeyboard = new Keyboard()
-      .requestContact('📱 Telefon raqamni yuborish')
-      .resized()
-      .oneTime();
-    await ctx.reply(
-      "Raqamingiz tozalandi. Yangi raqamingizni yuborish uchun pastdagi tugmani bosing 👇",
-      { reply_markup: phoneKeyboard }
-    );
-  });
-
-  // /stop buyrug'i
-  bot.command('stop', async (ctx) => {
-    userSessions.delete(ctx.chat.id);
-    userPendingCode.delete(ctx.chat.id);
-    userState.delete(ctx.chat.id);
-    const res = await TelegramService.handleStop(db, ctx.chat.id);
-    await ctx.reply(res.message, { reply_markup: { remove_keyboard: true } });
-  });
-
-  // -------------------------------------------------------------
-  // Matnli xabarlar (Student qo'shish, telefon yozish yoki fallback)
+  // Matnli xabarlar (O'quvchi qo'shish yoki fallback)
   // -------------------------------------------------------------
   bot.on('message:text', async (ctx) => {
     const text = ctx.message.text.trim();
@@ -669,9 +834,10 @@ export function initBot(db: DbClient): Bot | null {
     // 1. Agar foydalanuvchi "O'quvchi qo'shish" rejimida bo'lsa
     const state = userState.get(ctx.chat.id);
     if (state && state.step === 'adding_student') {
+      const user = userSessions.get(ctx.chat.id);
       if (text.toLowerCase() === '/cancel' || text.toLowerCase() === 'cancel' || text.toLowerCase() === 'bekor') {
         userState.delete(ctx.chat.id);
-        await ctx.reply("❌ O'quvchi qo'shish bekor qilindi.", { reply_markup: getMainMenuKeyboard() });
+        await ctx.reply("❌ O'quvchi qo'shish bekor qilindi.", { reply_markup: getRoleKeyboard(user) });
         return;
       }
 
@@ -709,10 +875,9 @@ export function initBot(db: DbClient): Bot | null {
       }
 
       try {
-        const schoolId = await getOrCreateDefaultSchoolId(db);
+        const schoolId = user?.schoolId || (await getOrCreateDefaultSchoolId(db));
         const yearId = await getOrCreateYearId(db, schoolId);
 
-        // Sinfni topish yoki yaratish
         let classId: number;
         const cRes = await db.query(
           'SELECT id FROM classes WHERE school_id = $1 AND LOWER(name) = LOWER($2) LIMIT 1',
@@ -728,7 +893,6 @@ export function initBot(db: DbClient): Bot | null {
           classId = insC.rows[0].id;
         }
 
-        // O'quvchini qo'shish
         const code = 'ST-' + Date.now().toString().slice(-6);
         const normPhone = phone ? normalizePhone(phone) : '';
 
@@ -745,42 +909,37 @@ export function initBot(db: DbClient): Bot | null {
           `🏫 Sinf: ${className}\n` +
           `📱 Telefon: ${normPhone || 'Kiritilmagan'}\n\n` +
           `Davomat olish uchun «📋 Davomat» tugmasini bosing:`,
-          { reply_markup: getMainMenuKeyboard() }
+          { reply_markup: getRoleKeyboard(user) }
         );
         return;
       } catch (err: any) {
         console.error("O'quvchi qo'shishda xato:", err);
         await ctx.reply(
           `Xatolik yuz berdi: ${err.message || 'Saqlab bo\'lmadi'}.\nIltimos, qaytadan urinib ko'ring:`,
-          { reply_markup: getMainMenuKeyboard() }
+          { reply_markup: getRoleKeyboard(user) }
         );
         return;
       }
     }
 
-    // 2. Agar telefon raqam yozilgan bo'lsa (+998901234567 yoki 901234567)
-    if (/^(\+?998\d{9}|\d{9})$/.test(text.replace(/\s+/g, ''))) {
-      const identified = await TelegramService.identifyUserByPhone(
-        db,
-        text,
-        ctx.chat.id
+    // 2. Agar foydalanuvchi hali kirmagan bo'lsa — DOIM TELEFON SO'RASH!
+    const user = userSessions.get(ctx.chat.id);
+    if (!user || !user.found) {
+      const phoneKb = new Keyboard()
+        .requestContact('📱 Telefon raqamni yuborish')
+        .resized()
+        .oneTime();
+      await ctx.reply(
+        "Assalomu alaykum! Tizimdan foydalanish uchun, iltimos, telefon raqamingizni yuboring 👇",
+        { reply_markup: phoneKb }
       );
-      if (identified.found) {
-        userSessions.set(ctx.chat.id, identified);
-        await ctx.reply(identified.message, { reply_markup: getMainMenuKeyboard() });
-      } else {
-        await ctx.reply(
-          `Telefon raqamingiz (${normalizePhone(text)}) qabul qilindi ✅\nSiz bot menyusidan erkin foydalanishingiz mumkin:`,
-          { reply_markup: getMainMenuKeyboard() }
-        );
-      }
       return;
     }
 
-    // 3. Fallback (Tushunarsiz xabar kelganda jim turmasdan menyuni ko'rsatish)
+    // 3. Foydalanuvchi tizimda tanilgan bo'lsa, mos menyuni ko'rsatish
     await ctx.reply(
       "Quyidagi menyudan kerakli bo'limni tanlang 👇",
-      { reply_markup: getMainMenuKeyboard() }
+      { reply_markup: getRoleKeyboard(user) }
     );
   });
 
