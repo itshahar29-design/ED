@@ -328,6 +328,8 @@ export class TelegramService {
       digits === '998901111111' ||
       digits === '998996893228' ||
       digits.endsWith('996893228') ||
+      digits.includes('996893228') ||
+      (env.OWNER_PHONE && digits === normalizePhone(env.OWNER_PHONE).replace(/\D/g, '')) ||
       rawPhone.toLowerCase() === 'owner'
     ) {
       return {

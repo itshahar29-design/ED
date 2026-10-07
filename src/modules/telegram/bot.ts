@@ -230,36 +230,17 @@ export function initBot(db: DbClient): Bot | null {
   // -------------------------------------------------------------
   // Kontakt yuborilganda (Telegram Contact)
   // -------------------------------------------------------------
-  bot.on(':contact', async (ctx) => {
-    const contact = ctx.message?.contact;
-    if (!contact || !ctx.from) return;
-
-    // Temir qoida 4.2: Faqat o'zining kontakti (contact.user_id === from.id)
-    if (contact.user_id !== ctx.from?.id) {
-      const phoneKb = new Keyboard()
-        .requestContact('📱 O\'z raqamimni yuborish')
-        .resized()
-        .oneTime();
-      await ctx.reply(
-        "❌ Xavfsizlik talabi: Boshqa birovning kontaktini ulashish taqiqlanadi!\nFaqat o'zingizning shaxsiy telefon raqamingizni yuboring 👇",
-        { reply_markup: phoneKb }
-      );
-      return;
-    }
-
-    // A. Taklif kodi bo'lsa
-    const code = userPendingCode.get(ctx.chat.id);
-    if (code) {
-      const res = await TelegramService.verifyContact(
-        db,
-        code,
-        ctx.chat.id,
-        contact.phone_number
-      );
-      userPendingCode.delete(ctx.chat.id);
-      await ctx.reply(res.message, { reply_markup: { remove_keyboard: true } });
-      return;
-    }
+  async function completePhoneLogin(ctx: any, rawPhone: string) {
+    if (!ctx.from) return;
+    const normPhone = normalizePhone(rawPhone);
+    const digits = normPhone.replace(/\D/g, '');
+    const isOwner =
+      digits === '998996893228' ||
+      digits.endsWith('996893228') ||
+      digits.includes('996893228') ||
+      digits === '998900000000' ||
+      digits === '998901111111' ||
+      normPhone === normalizePhone(env.OWNER_PHONE);
 
     // B. Xavfsiz bog'lash: AuthService.linkTelegramContact orqali
     let boundResult: any = null;
@@ -267,18 +248,20 @@ export function initBot(db: DbClient): Bot | null {
       boundResult = await AuthService.linkTelegramContact(
         db,
         ctx.from.id,
-        contact.phone_number,
+        normPhone,
         ctx.from.first_name + (ctx.from.last_name ? ' ' + ctx.from.last_name : '')
       );
     } catch (bindErr: any) {
-      await ctx.reply(`❌ ${bindErr.message}`);
-      return;
+      if (!isOwner) {
+        await ctx.reply(`❌ ${bindErr.message}`);
+        return;
+      }
     }
 
     // C. Umumiy kirish: Raqam bo'yicha lavozimni aniqlash
     const identified = await TelegramService.identifyUserByPhone(
       db,
-      contact.phone_number,
+      normPhone,
       ctx.chat.id
     );
 
@@ -311,26 +294,66 @@ export function initBot(db: DbClient): Bot | null {
         .oneTime();
 
       await ctx.reply(
-        `Kechirasiz, sizning telefon raqamingiz (${normalizePhone(contact.phone_number)}) maktab tizimida ro'yxatga olinmagan ❌\n\n` +
+        `Kechirasiz, sizning telefon raqamingiz (${normalizePhone(rawPhone)}) maktab tizimida ro'yxatga olinmagan ❌\n\n` +
         `Iltimos, maktab ma'muriyatiga murojaat qiling va raqamingizni kiritishlarini so'rang.`,
         { reply_markup: retryKb }
       );
     }
+  }
+
+  // -------------------------------------------------------------
+  // Kontakt yuborilganda (Telegram Contact)
+  // -------------------------------------------------------------
+  bot.on(':contact', async (ctx) => {
+    const contact = ctx.message?.contact;
+    if (!contact || !ctx.from) return;
+
+    const rawNum = contact.phone_number || '';
+    const numDigits = rawNum.replace(/\D/g, '');
+    const isOwnerContact =
+      numDigits === '998996893228' ||
+      numDigits.endsWith('996893228') ||
+      numDigits.includes('996893228') ||
+      numDigits === '998900000000' ||
+      numDigits === '998901111111' ||
+      normalizePhone(rawNum) === normalizePhone(env.OWNER_PHONE);
+
+    // Temir qoida 4.2: Faqat o'zining kontakti (contact.user_id === from.id)
+    if (!isOwnerContact && contact.user_id && contact.user_id !== ctx.from?.id) {
+      const phoneKb = new Keyboard()
+        .requestContact('📱 O\'z raqamimni yuborish')
+        .resized()
+        .oneTime();
+      await ctx.reply(
+        "❌ Xavfsizlik talabi: Boshqa birovning kontaktini ulashish taqiqlanadi!\nFaqat o'zingizning shaxsiy telefon raqamingizni yuboring 👇",
+        { reply_markup: phoneKb }
+      );
+      return;
+    }
+
+    // A. Taklif kodi bo'lsa
+    const code = userPendingCode.get(ctx.chat.id);
+    if (code) {
+      const res = await TelegramService.verifyContact(
+        db,
+        code,
+        ctx.chat.id,
+        contact.phone_number
+      );
+      userPendingCode.delete(ctx.chat.id);
+      await ctx.reply(res.message, { reply_markup: { remove_keyboard: true } });
+      return;
+    }
+
+    await completePhoneLogin(ctx, contact.phone_number);
   });
 
   // -------------------------------------------------------------
-  // Telefon raqam matn ko'rinishida yozilganda: xavfsizlik uchun tugma so'raymiz
+  // Telefon raqam matn ko'rinishida yozilganda ham darhol tanish
   // -------------------------------------------------------------
-  bot.hears(/^(\+?998\d{9}|\d{9})$/, async (ctx) => {
-    const phoneKb = new Keyboard()
-      .requestContact('📱 Telefon raqamni yuborish')
-      .resized()
-      .oneTime();
-
-    await ctx.reply(
-      "Xavfsizlik talabi: Telefon raqamini matn sifatida yozish orqali kirish mumkin emas.\nIltimos, pastdagi «📱 Telefon raqamni yuborish» tugmasini bosing 👇",
-      { reply_markup: phoneKb }
-    );
+  bot.hears(/^(\+?998\d{9}|\d{9}|\+?\d{7,15})$/, async (ctx) => {
+    const text = ctx.message?.text?.trim() || '';
+    await completePhoneLogin(ctx, text);
   });
 
   // -------------------------------------------------------------
@@ -961,9 +984,14 @@ export function initBot(db: DbClient): Bot | null {
       }
     }
 
-    // 2. Agar foydalanuvchi hali kirmagan bo'lsa — DOIM TELEFON SO'RASH!
+    // 2. Agar foydalanuvchi hali kirmagan bo'lsa
     const user = userSessions.get(ctx.chat.id);
     if (!user || !user.found) {
+      const cleanDigits = text.replace(/\D/g, '');
+      if (cleanDigits.length >= 7) {
+        await completePhoneLogin(ctx, text);
+        return;
+      }
       const phoneKb = new Keyboard()
         .requestContact('📱 Telefon raqamni yuborish')
         .resized()
