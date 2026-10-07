@@ -1,6 +1,7 @@
 import crypto from 'crypto';
 import { DbClient } from '../../db/client.js';
 import { env } from '../../config/env.js';
+import { isSchoolDay } from '../calendar/calendar.routes.js';
 
 const UZ_MONTHS: Record<number, string> = {
   1: 'yanvar',
@@ -578,7 +579,17 @@ export class TelegramService {
     schoolId: number,
     dateStr: string
   ): Promise<{ queued: number; reason?: string }> {
-    // 1. Maktab ish kunlarini tekshirish
+    // 1. Kalendar tekshiruvi: bayram yoki ta'til bormi?
+    const calRes = await db.query(
+      `SELECT id, name, kind FROM school_calendar
+       WHERE school_id = $1 AND date_from <= $2 AND date_to >= $2`,
+      [schoolId, dateStr]
+    );
+    if (calRes.rows.length > 0) {
+      return { queued: 0, reason: 'holiday' };
+    }
+
+    // 2. Maktab ish kunlarini tekshirish
     const sSet = await db.query(
       'SELECT days FROM school_settings WHERE school_id = $1',
       [schoolId]
@@ -591,7 +602,6 @@ export class TelegramService {
     }
     const days: number[] = Array.isArray(rawDays) ? rawDays : [0, 1, 2, 3, 4];
 
-    // Haftaning kuni (0=Dushanba, 6=Yakshanba)
     const dateObj = new Date(dateStr + 'T12:00:00Z');
     const dayOfWeek = (dateObj.getUTCDay() + 6) % 7;
 
@@ -599,13 +609,13 @@ export class TelegramService {
       return { queued: 0, reason: 'weekend' };
     }
 
-    // 2. Ushbu kundagi davomat sessiyalari
+    // 2. Ushbu kundagi davomat sessiyalari (faqat submitted sessiyalar)
     const sesRes = await db.query(
       `SELECT ses.id, ses.slot_no as slot_number, ses.class_id, c.name as class_name, sub.name as subject_name
        FROM attendance_sessions ses
        JOIN classes c ON ses.class_id = c.id AND ses.school_id = c.school_id
        JOIN subjects sub ON ses.subject_id = sub.id AND ses.school_id = sub.school_id
-       WHERE ses.school_id = $1 AND ses.date = $2
+       WHERE ses.school_id = $1 AND ses.date = $2 AND ses.status = 'submitted'
        ORDER BY ses.slot_no ASC`,
       [schoolId, dateStr]
     );

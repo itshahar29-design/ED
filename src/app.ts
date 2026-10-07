@@ -70,9 +70,29 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
   const { bootstrapRoutes } = await import('./modules/bootstrap/bootstrap.routes.js');
   await app.register(bootstrapRoutes);
 
+  // Positions routes (EduMemory 3.0 MAX)
+  const { positionsRoutes } = await import('./modules/positions/positions.routes.js');
+  await app.register(positionsRoutes);
+
+  // Access Requests routes (EduMemory 3.0 MAX)
+  const { accessRequestsRoutes } = await import('./modules/access-requests/access-requests.routes.js');
+  await app.register(accessRequestsRoutes);
+
+  // Calendar routes (EduMemory 3.0 MAX)
+  const { calendarRoutes } = await import('./modules/calendar/calendar.routes.js');
+  await app.register(calendarRoutes);
+
+  // Excuse Requests routes (Feature 6-A)
+  const { excuseRequestsRoutes } = await import('./modules/excuse-requests/excuse-requests.routes.js');
+  await app.register(excuseRequestsRoutes);
+
   // Telegram routes
   const { telegramRoutes } = await import('./modules/telegram/telegram.routes.js');
   await app.register(telegramRoutes);
+
+  // Control Center routes (Feature 6-B)
+  const { controlCenterRoutes } = await import('./modules/control-center/control-center.routes.js');
+  await app.register(controlCenterRoutes);
 
   // Serve index.html and static files from root
   const rootDir = process.cwd();

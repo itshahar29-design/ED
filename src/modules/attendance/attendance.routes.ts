@@ -59,6 +59,7 @@ export async function attendanceRoutes(app: FastifyInstance) {
     const schema = z.object({
       version: z.coerce.number().default(0),
       records: z.record(z.enum(['p', 'a', 'l', 'e'])).default({}),
+      status: z.enum(['draft', 'submitted']).optional(),
     });
     const parsed = schema.safeParse(request.body);
     if (!parsed.success) return reply.status(400).send({ error: parsed.error.errors[0].message });
@@ -81,6 +82,7 @@ export async function attendanceRoutes(app: FastifyInstance) {
         {
           version: parsed.data.version,
           records: parsed.data.records as Record<number, 'p' | 'a' | 'l' | 'e'>,
+          status: parsed.data.status,
         },
         auth.user,
         request.ip
@@ -93,6 +95,59 @@ export async function attendanceRoutes(app: FastifyInstance) {
       }
 
       return reply.send(respBody);
+    } catch (err: any) {
+      if (err.statusCode === 409) {
+        return reply.status(409).send({
+          error: err.message,
+          current_version: err.current_version,
+          records: err.current_records,
+        });
+      }
+      return reply.status(400).send({ error: err.message });
+    }
+  });
+
+  // 2b. POST /api/v1/attendance/sessions/:slotId/:date/submit
+  app.post('/api/v1/attendance/sessions/:slotId/:date/submit', async (
+    request: FastifyRequest<{
+      Params: { slotId: string; date: string };
+      Body: { version?: number; records?: Record<string, 'p' | 'a' | 'l' | 'e'> };
+    }>,
+    reply: FastifyReply
+  ) => {
+    const auth = await getAuth(request, db);
+    if (!auth) return reply.status(401).send({ error: 'Avtorizatsiya talab qilinadi' });
+    const schoolId = getEffectiveSchoolId(auth.user);
+
+    if (!can(auth.user, 'MARK_ATTENDANCE', { type: 'attendance', school_id: schoolId }, { permissions: auth.permissions })) {
+      return reply.status(403).send({ error: 'Davomat belgilashga ruxsat yo\'q' });
+    }
+
+    const slotId = Number(request.params.slotId);
+    const date = request.params.date;
+
+    const schema = z.object({
+      version: z.coerce.number().default(0),
+      records: z.record(z.enum(['p', 'a', 'l', 'e'])).default({}),
+    });
+    const parsed = schema.safeParse(request.body || {});
+    if (!parsed.success) return reply.status(400).send({ error: parsed.error.errors[0].message });
+
+    try {
+      const result = await AttendanceService.submitSessionAttendance(
+        db,
+        schoolId,
+        slotId,
+        date,
+        {
+          version: parsed.data.version,
+          records: parsed.data.records as Record<number, 'p' | 'a' | 'l' | 'e'>,
+        },
+        auth.user,
+        request.ip
+      );
+
+      return reply.send({ status: 'ok', data: result });
     } catch (err: any) {
       if (err.statusCode === 409) {
         return reply.status(409).send({
@@ -231,5 +286,20 @@ export async function attendanceRoutes(app: FastifyInstance) {
     reply.header('Content-Type', 'text/csv; charset=utf-8');
     reply.header('Content-Disposition', `attachment; filename="davomat-${new Date().toISOString().slice(0, 10)}.csv"`);
     return reply.send(csvContent);
+  });
+
+  // 7. GET /api/v1/risk — Xavf ro'yxati
+  app.get('/api/v1/risk', async (request: FastifyRequest, reply: FastifyReply) => {
+    const auth = await getAuth(request, db);
+    if (!auth) return reply.status(401).send({ error: 'Avtorizatsiya talab qilinadi' });
+    const schoolId = getEffectiveSchoolId(auth.user);
+
+    if (!can(auth.user, 'VIEW_RISK', { type: 'report', school_id: schoolId }, { permissions: auth.permissions }) &&
+        !['owner', 'director', 'deputy_academic', 'deputy_edu', 'psychologist', 'class_leader'].includes(auth.user.role)) {
+      return reply.status(403).send({ error: 'Xavf ro\'yxatini ko\'rishga ruxsat yo\'q' });
+    }
+
+    const riskList = await AttendanceService.getRiskStudents(db, schoolId);
+    return reply.send({ status: 'ok', data: riskList });
   });
 }

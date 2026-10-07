@@ -5,6 +5,7 @@ import { createTestDb, DbClient } from '../src/db/client.js';
 import { AuthService } from '../src/modules/auth/auth.service.js';
 import { AuthUser } from '../src/modules/auth/permissions.js';
 import { getTodayInTashkent } from '../src/modules/attendance/attendance.service.js';
+import { isSchoolDay } from '../src/modules/calendar/calendar.routes.js';
 
 describe('M3: Davomat, sababli, hisobot, CSV', () => {
   let app: FastifyInstance;
@@ -369,5 +370,131 @@ describe('M3: Davomat, sababli, hisobot, CSV', () => {
 
     // Formula injection himoyasi: "=FormulaAttack" oldiga ' qo'yilgan bo'lishi kerak
     expect(csvText).toContain("'=FormulaAttack");
+  });
+
+  it('8. K5: Darsni ochish hech qanday yozuv yaratmaydi (0 records)', async () => {
+    // Kechagi sana bo'yicha dars ochilsa (GET)
+    const yesterday = new Date(Date.now() - 86400000).toISOString().slice(0, 10);
+    const getRes = await app.inject({
+      method: 'GET',
+      url: `/api/v1/attendance?date=${yesterday}`,
+      headers: { cookie: teacher1Cookie },
+    });
+    expect(getRes.statusCode).toBe(200);
+
+    // Bazada bu sana uchun attendance_sessions va attendance_records bo'sh bo'lishi shart!
+    const recCount = await testDb.query(
+      'SELECT COUNT(*)::int as cnt FROM attendance_records WHERE school_id = $1',
+      [schoolId]
+    );
+    // Avvalgi testlardagi yozuvlar sonini o'zgartirmasligi kerak
+    const sessCount = await testDb.query(
+      'SELECT COUNT(*)::int as cnt FROM attendance_sessions WHERE school_id = $1 AND date = $2',
+      [schoolId, yesterday]
+    );
+    expect(sessCount.rows[0].cnt).toBe(0);
+  });
+
+  it('9. Draft sessiya hisobotga kirmaydi; submit qilingandan keyin ko\'rinadi', async () => {
+    // 2 kun oldingi sana uchun draft saqlash
+    const pastDate = new Date(Date.now() - 2 * 86400000).toISOString().slice(0, 10);
+    
+    // Draft sifatida saqlash
+    const draftRes = await app.inject({
+      method: 'PUT',
+      url: `/api/v1/attendance/sessions/${slotId}/${pastDate}`,
+      headers: { cookie: teacher1Cookie },
+      payload: {
+        version: 0,
+        records: {
+          [student1Id]: 'a',
+          [student2Id]: 'a',
+        },
+        status: 'draft',
+      },
+    });
+    expect(draftRes.statusCode).toBe(200);
+    expect(JSON.parse(draftRes.body).data.status).toBe('draft');
+
+    // Hisobotda pastDate bo'yicha ko'rinmasligi kerak!
+    const repRes1 = await app.inject({
+      method: 'GET',
+      url: `/api/v1/reports?from=${pastDate}&to=${pastDate}`,
+      headers: { cookie: directorCookie },
+    });
+    expect(repRes1.statusCode).toBe(200);
+    expect(JSON.parse(repRes1.body).data.records.length).toBe(0);
+
+    // Endi submit qilish: POST /sessions/:slotId/:date/submit
+    const subRes = await app.inject({
+      method: 'POST',
+      url: `/api/v1/attendance/sessions/${slotId}/${pastDate}/submit`,
+      headers: { cookie: teacher1Cookie },
+      payload: {
+        version: 1,
+        records: {
+          [student1Id]: 'p',
+          [student2Id]: 'p',
+        },
+      },
+    });
+    expect(subRes.statusCode).toBe(200);
+    expect(JSON.parse(subRes.body).data.status).toBe('submitted');
+
+    // Endi hisobotda ko'rinishi kerak!
+    const repRes2 = await app.inject({
+      method: 'GET',
+      url: `/api/v1/reports?from=${pastDate}&to=${pastDate}`,
+      headers: { cookie: directorCookie },
+    });
+    expect(repRes2.statusCode).toBe(200);
+    expect(JSON.parse(repRes2.body).data.records.length).toBeGreaterThan(0);
+  });
+
+  it('10. Xavf signali (GET /api/v1/risk): davomat foizi past o\'quvchini aniqlash', async () => {
+    const riskRes = await app.inject({
+      method: 'GET',
+      url: '/api/v1/risk',
+      headers: { cookie: directorCookie },
+    });
+    expect(riskRes.statusCode).toBe(200);
+    const riskData = JSON.parse(riskRes.body).data;
+    expect(Array.isArray(riskData)).toBe(true);
+
+    // Student 3 (FormulaAttack) foizi 0% edi, xavf ro'yxatida bo'lishi kerak
+    const riskSt3 = riskData.find((r: any) => r.student_id === student3Id);
+    expect(riskSt3).toBeDefined();
+    expect(riskSt3.reasons).toContain('low_rate');
+  });
+
+  it('11. Kalendar va isSchoolDay: bayram va dam olish kunlarini hisobga olish', async () => {
+    const holidayDate = '2026-03-21'; // Navro'z
+
+    // Kalendarga bayram kiritish
+    const addCalRes = await app.inject({
+      method: 'POST',
+      url: '/api/v1/calendar',
+      headers: { cookie: directorCookie },
+      payload: {
+        date_from: holidayDate,
+        date_to: holidayDate,
+        kind: 'holiday',
+        name: "Navro'z bayrami",
+      },
+    });
+    expect(addCalRes.statusCode).toBe(200);
+    const calId = JSON.parse(addCalRes.body).data.id;
+
+    // isSchoolDay tekshiruvi: bayram kuni o'qish kuni emas (false)
+    const isSchool = await isSchoolDay(testDb, schoolId, holidayDate);
+    expect(isSchool).toBe(false);
+
+    // Kalendardan o'chirish
+    const delCalRes = await app.inject({
+      method: 'DELETE',
+      url: `/api/v1/calendar/${calId}`,
+      headers: { cookie: directorCookie },
+    });
+    expect(delCalRes.statusCode).toBe(200);
   });
 });

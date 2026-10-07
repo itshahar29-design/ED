@@ -1,6 +1,7 @@
 import { Bot, Keyboard, InlineKeyboard } from 'grammy';
 import { DbClient } from '../../db/client.js';
 import { TelegramService, normalizePhone, formatUzDate } from './telegram.service.js';
+import { AuthService } from '../auth/auth.service.js';
 import { env } from '../../config/env.js';
 
 let botInstance: Bot | null = null;
@@ -121,6 +122,17 @@ export function initBot(db: DbClient): Bot | null {
   const bot = new Bot(env.TELEGRAM_BOT_TOKEN);
   botInstance = bot;
 
+  // Temir qoida 12.2 #2: Bot faqat shaxsiy chatda ishlaydi (private)
+  bot.use(async (ctx, next) => {
+    if (ctx.chat && ctx.chat.type !== 'private') {
+      try {
+        await ctx.leaveChat();
+      } catch {}
+      return;
+    }
+    return next();
+  });
+
   // Bot buyruqlari ro'yxati (Telegram Command Menu)
   bot.api
     .setMyCommands([
@@ -220,7 +232,20 @@ export function initBot(db: DbClient): Bot | null {
   // -------------------------------------------------------------
   bot.on(':contact', async (ctx) => {
     const contact = ctx.message?.contact;
-    if (!contact) return;
+    if (!contact || !ctx.from) return;
+
+    // Temir qoida 4.2: Faqat o'zining kontakti (contact.user_id === from.id)
+    if (contact.user_id !== ctx.from?.id) {
+      const phoneKb = new Keyboard()
+        .requestContact('📱 O\'z raqamimni yuborish')
+        .resized()
+        .oneTime();
+      await ctx.reply(
+        "❌ Xavfsizlik talabi: Boshqa birovning kontaktini ulashish taqiqlanadi!\nFaqat o'zingizning shaxsiy telefon raqamingizni yuboring 👇",
+        { reply_markup: phoneKb }
+      );
+      return;
+    }
 
     // A. Taklif kodi bo'lsa
     const code = userPendingCode.get(ctx.chat.id);
@@ -236,7 +261,21 @@ export function initBot(db: DbClient): Bot | null {
       return;
     }
 
-    // B. Umumiy kirish: Raqam bo'yicha lavozimni aniqlash
+    // B. Xavfsiz bog'lash: AuthService.linkTelegramContact orqali
+    let boundResult: any = null;
+    try {
+      boundResult = await AuthService.linkTelegramContact(
+        db,
+        ctx.from.id,
+        contact.phone_number,
+        ctx.from.first_name + (ctx.from.last_name ? ' ' + ctx.from.last_name : '')
+      );
+    } catch (bindErr: any) {
+      await ctx.reply(`❌ ${bindErr.message}`);
+      return;
+    }
+
+    // C. Umumiy kirish: Raqam bo'yicha lavozimni aniqlash
     const identified = await TelegramService.identifyUserByPhone(
       db,
       contact.phone_number,
@@ -245,9 +284,26 @@ export function initBot(db: DbClient): Bot | null {
 
     if (identified.found) {
       userSessions.set(ctx.chat.id, identified);
+
+      const webAppUrl = getWebAppUrl();
+      const directUrl = boundResult?.sessionToken
+        ? `${webAppUrl}/api/v1/auth/direct-login?token=${boundResult.sessionToken}`
+        : webAppUrl;
+
+      const inline = new InlineKeyboard()
+        .webApp('🚀 Saytga kirish (Mini App)', webAppUrl)
+        .row()
+        .url('🌐 Brauzerda ochish (Avto-kirish)', directUrl);
+
       await ctx.reply(identified.message, {
         reply_markup: getRoleKeyboard(identified),
       });
+
+      await ctx.reply(
+        `✅ Telefon raqamingiz muvaffaqiyatli bog'landi va avtomatik tizimga kirdingiz!\n\n` +
+        `Davomat tizimini bir bosishda ochish uchun quyidagi tugmani bosing 👇`,
+        { reply_markup: inline }
+      );
     } else {
       const retryKb = new Keyboard()
         .requestContact('📱 Boshqa raqam yuborish')
@@ -263,35 +319,18 @@ export function initBot(db: DbClient): Bot | null {
   });
 
   // -------------------------------------------------------------
-  // Telefon raqam matn ko'rinishida yozilganda (+998996893228 yoki 996893228)
+  // Telefon raqam matn ko'rinishida yozilganda: xavfsizlik uchun tugma so'raymiz
   // -------------------------------------------------------------
   bot.hears(/^(\+?998\d{9}|\d{9})$/, async (ctx) => {
-    const text = ctx.message?.text || '';
-    const raw = text.trim().replace(/\s+/g, '');
-    if (!raw) return;
-    const identified = await TelegramService.identifyUserByPhone(
-      db,
-      raw,
-      ctx.chat.id
+    const phoneKb = new Keyboard()
+      .requestContact('📱 Telefon raqamni yuborish')
+      .resized()
+      .oneTime();
+
+    await ctx.reply(
+      "Xavfsizlik talabi: Telefon raqamini matn sifatida yozish orqali kirish mumkin emas.\nIltimos, pastdagi «📱 Telefon raqamni yuborish» tugmasini bosing 👇",
+      { reply_markup: phoneKb }
     );
-
-    if (identified.found) {
-      userSessions.set(ctx.chat.id, identified);
-      await ctx.reply(identified.message, {
-        reply_markup: getRoleKeyboard(identified),
-      });
-    } else {
-      const retryKb = new Keyboard()
-        .requestContact('📱 Boshqa raqam yuborish')
-        .resized()
-        .oneTime();
-
-      await ctx.reply(
-        `Kechirasiz, sizning telefon raqamingiz (${normalizePhone(raw)}) maktab tizimida ro'yxatga olinmagan ❌\n\n` +
-        `Iltimos, maktab ma'muriyatiga murojaat qiling va raqamingizni kiritishlarini so'rang.`,
-        { reply_markup: retryKb }
-      );
-    }
   });
 
   // -------------------------------------------------------------

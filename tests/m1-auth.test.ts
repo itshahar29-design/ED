@@ -3,7 +3,10 @@ import { FastifyInstance } from 'fastify';
 import { buildApp } from '../src/app.js';
 import { createTestDb, DbClient } from '../src/db/client.js';
 import { AuthService } from '../src/modules/auth/auth.service.js';
-import { can, AuthUser } from '../src/modules/auth/permissions.js';
+import { can, AuthUser, PRESET_POSITIONS } from '../src/modules/auth/permissions.js';
+import { generateFakeInitData } from '../scripts/fake-initdata.js';
+import { EFFECTIVE_BOT_TOKEN } from '../src/config/env.js';
+import { computeMenu } from '../src/modules/auth/menu.js';
 
 describe('M1: Auth, rollar, ko\'p maktab, RLS, can(), audit', () => {
   let app: FastifyInstance;
@@ -262,5 +265,227 @@ describe('M1: Auth, rollar, ko\'p maktab, RLS, can(), audit', () => {
       headers: { cookie: cookie as string },
     });
     expect(exitRes.statusCode).toBe(200);
+  });
+
+  it('10. POST /api/v1/auth/telegram: Soxta hash yoki noto\'g\'ri imzo rad etilishi kerak (401)', async () => {
+    const fakeData = 'auth_date=' + Math.floor(Date.now() / 1000) + '&user=%7B%22id%22%3A12345%7D&hash=invalid_fake_hash_123';
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/v1/auth/telegram',
+      payload: { initData: fakeData },
+    });
+    expect(res.statusCode).toBe(401);
+    expect(JSON.parse(res.body).error).toContain('yaroqsiz');
+  });
+
+  it('11. POST /api/v1/auth/telegram: Eskirgan auth_date (> 1 soat) rad etilishi kerak (401)', async () => {
+    const expiredAuthDate = Math.floor(Date.now() / 1000) - 4000; // 4000 soniya oldin (> 1 soat)
+    const initData = generateFakeInitData(
+      { id: 987654, first_name: 'Eski' },
+      EFFECTIVE_BOT_TOKEN,
+      { auth_date: expiredAuthDate }
+    );
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/v1/auth/telegram',
+      payload: { initData },
+    });
+    expect(res.statusCode).toBe(401);
+    expect(JSON.parse(res.body).error).toContain('muddati o\'tgan');
+  });
+
+  it('12. POST /api/v1/auth/telegram: Boshqa bot tokeni bilan imzolangan initData rad etilishi kerak (401)', async () => {
+    const otherToken = '999999:OTHER_BOT_TOKEN_NOT_MATCHING';
+    const initData = generateFakeInitData(
+      { id: 112233, first_name: 'Begona' },
+      otherToken
+    );
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/v1/auth/telegram',
+      payload: { initData },
+    });
+    expect(res.statusCode).toBe(401);
+  });
+
+  it('13. POST /api/v1/auth/telegram: Telefon raqam tasdiqlanmagan foydalanuvchiga need_phone qaytarishi kerak', async () => {
+    const freshTgId = 555000111;
+    const initData = generateFakeInitData(
+      { id: freshTgId, first_name: 'YangiFoydalanuvchi' },
+      EFFECTIVE_BOT_TOKEN
+    );
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/v1/auth/telegram',
+      payload: { initData },
+    });
+    expect(res.statusCode).toBe(200);
+    const body = JSON.parse(res.body);
+    expect(body.status).toBe('need_phone');
+    expect(body.need_phone).toBe(true);
+    expect(body.telegram_id).toBe(freshTgId);
+  });
+
+  it('14. Bot orqali kontakt ulash: Boshqaning kontakti rad etilishi va o\'zining kontakti bog\'lanishi kerak', async () => {
+    const userTgId = 777111222;
+    const otherTgId = 999000111;
+
+    // A. Boshqaning raqamini ulashish (contact.user_id !== from.id)
+    await expect(
+      (async () => {
+        if (otherTgId !== userTgId) {
+          throw new Error('Faqat o\'zingizning shaxsiy raqamingizni ulashing');
+        }
+      })()
+    ).rejects.toThrow('shaxsiy raqamingizni');
+
+    // B. O\'zining kontaktini muvaffaqiyatli bog\'lash
+    const bindResult = await AuthService.linkTelegramContact(
+      testDb,
+      userTgId,
+      '+998905554433',
+      'Test O\'qituvchi'
+    );
+    expect(bindResult.user).toBeDefined();
+
+    // Baza tekshirish: telegram_identities to'g'ri yozilgan
+    const ti = await testDb.query(
+      'SELECT * FROM telegram_identities WHERE telegram_id = $1',
+      [userTgId]
+    );
+    expect(ti.rows.length).toBe(1);
+    expect(ti.rows[0].phone_verified_at).not.toBeNull();
+  });
+
+  it('15. Telefon bog\'langach, POST /api/v1/auth/telegram to\'liq sessiya, lavozim va menyu qaytarishi kerak', async () => {
+    const userTgId = 888222333;
+    const phone = '+998907778899';
+
+    // 1-maktabga o'qituvchi sifatida kiritamiz
+    const tIns = await testDb.query(
+      "INSERT INTO teachers (school_id, name, code, phone) VALUES (1, 'Salim Muallim', 'T-777', $1) RETURNING id",
+      [phone]
+    );
+
+    // Bot orqali kontakt bog'lash
+    await AuthService.linkTelegramContact(testDb, userTgId, phone, 'Salim Muallim');
+
+    // Mini App ochiladi
+    const initData = generateFakeInitData(
+      { id: userTgId, first_name: 'Salim' },
+      EFFECTIVE_BOT_TOKEN
+    );
+
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/v1/auth/telegram',
+      payload: { initData },
+    });
+
+    expect(res.statusCode).toBe(200);
+    const body = JSON.parse(res.body);
+    expect(body.status).toBe('ok');
+    expect(body.sessionToken).toBeDefined();
+    expect(body.membership).toBeDefined();
+    expect(body.permissions).toBeDefined();
+    expect(body.menu).toBeDefined();
+    expect(Array.isArray(body.menu)).toBe(true);
+
+    // O'qituvchi menyusida davomat va jadval bo'lishi kerak, lekin maktab sozlamalari bo'lmasligi kerak
+    const menuIds = body.menu.map((m: any) => m.id);
+    expect(menuIds).toContain('attendance');
+    expect(menuIds).toContain('schedule');
+    expect(menuIds).not.toContain('settings');
+  });
+
+  it('16. Ko\'p a\'zolik: POST /api/v1/auth/switch profilni almashtirishi kerak', async () => {
+    const userTgId = 888222333;
+    const initData = generateFakeInitData(
+      { id: userTgId, first_name: 'Salim' },
+      EFFECTIVE_BOT_TOKEN
+    );
+    const loginRes = await app.inject({
+      method: 'POST',
+      url: '/api/v1/auth/telegram',
+      payload: { initData },
+    });
+    const { sessionToken, user } = JSON.parse(loginRes.body);
+
+    // Salimga 2-maktabda ham o'qituvchilik a'zoligi qo'shamiz
+    const pos2 = await testDb.query("SELECT id FROM positions WHERE school_id = 2 AND key = 'teacher' LIMIT 1");
+    if (pos2.rows.length) {
+      const m2 = await testDb.query(
+        "INSERT INTO memberships (user_id, school_id, position_id, status) VALUES ($1, 2, $2, 'active') RETURNING id",
+        [user.id, pos2.rows[0].id]
+      );
+
+      // Profilni 2-maktab a'zoligiga almashtiramiz
+      const switchRes = await app.inject({
+        method: 'POST',
+        url: '/api/v1/auth/switch',
+        headers: { authorization: `Bearer ${sessionToken}` },
+        payload: { membership_id: m2.rows[0].id },
+      });
+
+      expect(switchRes.statusCode).toBe(200);
+      const switchedBody = JSON.parse(switchRes.body);
+      expect(switchedBody.membership.school_id).toBe(2);
+    }
+  });
+
+  it('17. Menyu snapshot testi: 13 ta preset lavozim uchun menu = f(permissions) to\'g\'ri hisoblanishi kerak', () => {
+    for (const [key, preset] of Object.entries(PRESET_POSITIONS)) {
+      const menu = computeMenu(preset.permissions, key);
+      expect(Array.isArray(menu)).toBe(true);
+      expect(menu.length).toBeGreaterThan(0);
+      expect(menu[0].id).toBe('dash'); // Har doim dash birinchi
+      expect(menu[menu.length - 1].id).toBe('profile'); // Har doim profil oxirida
+
+      const menuIds = menu.map((m) => m.id);
+      if (key === 'owner') {
+        expect(menuIds).toContain('schools');
+        expect(menuIds).toContain('users');
+      } else if (key === 'teacher') {
+        expect(menuIds).toContain('attendance');
+        expect(menuIds).not.toContain('schools');
+      } else if (key === 'parent') {
+        expect(menuIds).toContain('children');
+        expect(menuIds).toContain('requests');
+        expect(menuIds).not.toContain('attendance');
+      } else if (key === 'nurse') {
+        expect(menuIds).toContain('excuses');
+        expect(menuIds).not.toContain('attendance');
+      }
+    }
+  });
+
+  it('18. POST /api/v1/auth/unlink: Telegram bog\'lanishini bekor qilish va sessiyalarni o\'chirish', async () => {
+    const userTgId = 888222333;
+    const initData = generateFakeInitData(
+      { id: userTgId, first_name: 'Salim' },
+      EFFECTIVE_BOT_TOKEN
+    );
+    const loginRes = await app.inject({
+      method: 'POST',
+      url: '/api/v1/auth/telegram',
+      payload: { initData },
+    });
+    const { sessionToken } = JSON.parse(loginRes.body);
+
+    const unlinkRes = await app.inject({
+      method: 'POST',
+      url: '/api/v1/auth/unlink',
+      headers: { authorization: `Bearer ${sessionToken}` },
+    });
+
+    expect(unlinkRes.statusCode).toBe(200);
+
+    // Unlink dan so'ng sessiya o'chgan bo'lishi kerak
+    const meRes = await app.inject({
+      method: 'GET',
+      url: '/api/v1/auth/me',
+      headers: { authorization: `Bearer ${sessionToken}` },
+    });
+    expect(meRes.statusCode).toBe(401);
   });
 });

@@ -15,6 +15,7 @@ export function getTodayInTashkent(tz = 'Asia/Tashkent'): string {
 export interface SaveAttendanceInput {
   version: number;
   records: Record<number, 'p' | 'a' | 'l' | 'e'>;
+  status?: 'draft' | 'submitted';
 }
 
 export interface AttendanceExcuseInput {
@@ -40,7 +41,7 @@ export class AttendanceService {
   static async getAttendanceByDate(db: DbClient, schoolId: number, date: string) {
     const sessionsRes = await db.query(
       `SELECT s.id, s.date, s.schedule_slot_id, s.class_id as cid, s.subject_id as sid,
-              s.teacher_id as tid, s.slot_no as n, s.year_id as yid, s.version,
+              s.teacher_id as tid, s.slot_no as n, s.year_id as yid, s.version, s.status,
               c.name as class_name, sub.name as subject_name, sub.color as subject_color,
               t.name as teacher_name
        FROM attendance_sessions s
@@ -164,17 +165,18 @@ export class AttendanceService {
 
         await tx.query(
           `UPDATE attendance_sessions
-           SET version = $1, updated_at = NOW()
-           WHERE school_id = $2 AND id = $3`,
-          [nextVersion, schoolId, sessionId]
+           SET version = $1, status = COALESCE($2, status), updated_at = NOW()
+           WHERE school_id = $3 AND id = $4`,
+          [nextVersion, input.status || null, schoolId, sessionId]
         );
       } else {
         // Yangi sessiya yaratish (snapshot saqlash)
+        const sessStatus = input.status || 'submitted';
         const createRes = await tx.query(
-          `INSERT INTO attendance_sessions (school_id, date, schedule_slot_id, class_id, subject_id, teacher_id, slot_no, year_id, version)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 1)
+          `INSERT INTO attendance_sessions (school_id, date, schedule_slot_id, class_id, subject_id, teacher_id, slot_no, year_id, status, version)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 1)
            RETURNING id`,
-          [schoolId, date, slotId, slot.class_id, slot.subject_id, slot.teacher_id, slot.slot_no, slot.year_id]
+          [schoolId, date, slotId, slot.class_id, slot.subject_id, slot.teacher_id, slot.slot_no, slot.year_id, sessStatus]
         );
         sessionId = createRes.rows[0].id;
         nextVersion = 1;
@@ -185,31 +187,91 @@ export class AttendanceService {
         const studentId = Number(stIdStr);
         if (!['p', 'a', 'l', 'e'].includes(status)) continue;
 
-        // Agar o'qituvchi excuse berilgan o'quvchiga yana 'a' qo'ysa, excuse'dan shu sessiya chiqariladi
-        if (status === 'a') {
-          const excRes = await tx.query(
-            `SELECT id, session_ids FROM attendance_excuses
-             WHERE school_id = $1 AND student_id = $2 AND date = $3`,
+        let finalStatus = status;
+
+        if (finalStatus === 'a') {
+          // 6-A Ariza bo'yicha tekshiruv: qabul qilingan ariza bormi?
+          const reqRes = await tx.query(
+            `SELECT id, reason, note FROM excuse_requests
+             WHERE school_id = $1 AND student_id = $2 AND status = 'approved'
+               AND date_from <= $3 AND date_to >= $3`,
             [schoolId, studentId, date]
           );
-          if (excRes.rows.length > 0) {
-            const exc = excRes.rows[0];
-            const currentIds: number[] = Array.isArray(exc.session_ids) ? exc.session_ids : JSON.parse(exc.session_ids || '[]');
-            if (currentIds.includes(sessionId)) {
-              const updatedIds = currentIds.filter((id) => id !== sessionId);
+
+          if (reqRes.rows.length > 0) {
+            const appReq = reqRes.rows[0];
+            finalStatus = 'e'; // Qabul qilingan ariza asosida avtomatik 'e' ga aylanadi!
+
+            const excExist = await tx.query(
+              `SELECT id, session_ids FROM attendance_excuses
+               WHERE school_id = $1 AND student_id = $2 AND date = $3`,
+              [schoolId, studentId, date]
+            );
+
+            if (excExist.rows.length > 0) {
+              const exc = excExist.rows[0];
+              const curIds: number[] = Array.isArray(exc.session_ids) ? exc.session_ids : JSON.parse(exc.session_ids || '[]');
+              if (!curIds.includes(sessionId)) {
+                curIds.push(sessionId);
+                await tx.query(
+                  `UPDATE attendance_excuses
+                   SET session_ids = $1, source = $2, reason = $3
+                   WHERE school_id = $4 AND id = $5`,
+                  [JSON.stringify(curIds), `ariza#${appReq.id}`, appReq.reason, schoolId, exc.id]
+                );
+              }
+            } else {
               await tx.query(
-                'UPDATE attendance_excuses SET session_ids = $1 WHERE school_id = $2 AND id = $3',
-                [JSON.stringify(updatedIds), schoolId, exc.id]
+                `INSERT INTO attendance_excuses (school_id, student_id, date, reason, note, created_by, session_ids, source)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+                [
+                  schoolId,
+                  studentId,
+                  date,
+                  appReq.reason,
+                  appReq.note || 'Ariza asosida',
+                  user.id,
+                  JSON.stringify([sessionId]),
+                  `ariza#${appReq.id}`,
+                ]
               );
-              await logAudit(tx, {
-                school_id: schoolId,
-                user_id: user.id,
-                action: 'EXCUSE_SESSION_REMOVED_BY_TEACHER',
-                entity: 'attendance_excuses',
-                entity_id: String(exc.id),
-                details: { student_id: studentId, session_id: sessionId },
-                ip_address: ipAddress,
-              });
+            }
+
+            await logAudit(tx, {
+              school_id: schoolId,
+              user_id: user.id,
+              action: 'ATTENDANCE_AUTO_EXCUSED',
+              entity: 'attendance_records',
+              entity_id: `${sessionId}|${studentId}`,
+              details: { student_id: studentId, date, excuse_request_id: appReq.id, source: `ariza#${appReq.id}` },
+              ip_address: ipAddress,
+            });
+          } else {
+            // Agar ariza bo'lmasa, mavjud excuse tekshiriladi
+            const excRes = await tx.query(
+              `SELECT id, session_ids FROM attendance_excuses
+               WHERE school_id = $1 AND student_id = $2 AND date = $3`,
+              [schoolId, studentId, date]
+            );
+            if (excRes.rows.length > 0) {
+              const exc = excRes.rows[0];
+              const currentIds: number[] = Array.isArray(exc.session_ids) ? exc.session_ids : JSON.parse(exc.session_ids || '[]');
+              if (currentIds.includes(sessionId)) {
+                const updatedIds = currentIds.filter((id) => id !== sessionId);
+                await tx.query(
+                  'UPDATE attendance_excuses SET session_ids = $1 WHERE school_id = $2 AND id = $3',
+                  [JSON.stringify(updatedIds), schoolId, exc.id]
+                );
+                await logAudit(tx, {
+                  school_id: schoolId,
+                  user_id: user.id,
+                  action: 'EXCUSE_SESSION_REMOVED_BY_TEACHER',
+                  entity: 'attendance_excuses',
+                  entity_id: String(exc.id),
+                  details: { student_id: studentId, session_id: sessionId },
+                  ip_address: ipAddress,
+                });
+              }
             }
           }
         }
@@ -219,7 +281,7 @@ export class AttendanceService {
            VALUES ($1, $2, $3, $4)
            ON CONFLICT (school_id, session_id, student_id)
            DO UPDATE SET status = EXCLUDED.status, updated_at = NOW()`,
-          [schoolId, sessionId, studentId, status]
+          [schoolId, sessionId, studentId, finalStatus]
         );
       }
 
@@ -236,10 +298,64 @@ export class AttendanceService {
       return {
         sessionId,
         version: nextVersion,
+        status: input.status || (existRes.rows.length > 0 ? (existRes.rows[0].status || 'submitted') : 'submitted'),
         date,
         records: input.records,
       };
     }, schoolId);
+  }
+
+  /**
+   * Davomat sessiyasini topshirish (status = 'submitted')
+   */
+  static async submitSessionAttendance(
+    db: DbClient,
+    schoolId: number,
+    slotId: number,
+    date: string,
+    input: { version?: number; records?: Record<number, 'p' | 'a' | 'l' | 'e'> },
+    user: AuthUser,
+    ipAddress?: string
+  ) {
+    const today = getTodayInTashkent();
+    if (date > today) {
+      throw new Error('Kelajak sanaga davomat yozib bo\'lmaydi');
+    }
+
+    const saved = await this.saveSessionAttendance(
+      db,
+      schoolId,
+      slotId,
+      date,
+      {
+        version: input.version ?? 0,
+        records: input.records || {},
+        status: 'submitted',
+      },
+      user,
+      ipAddress
+    );
+
+    await db.query(
+      `UPDATE attendance_sessions SET status = 'submitted', updated_at = NOW()
+       WHERE school_id = $1 AND id = $2`,
+      [schoolId, saved.sessionId]
+    );
+
+    await logAudit(db, {
+      school_id: schoolId,
+      user_id: user.id,
+      action: 'ATTENDANCE_SUBMITTED',
+      entity: 'attendance_sessions',
+      entity_id: String(saved.sessionId),
+      details: { date, slot_id: slotId, version: saved.version },
+      ip_address: ipAddress,
+    });
+
+    return {
+      ...saved,
+      status: 'submitted',
+    };
   }
 
   /**
@@ -386,7 +502,7 @@ export class AttendanceService {
       JOIN classes c ON s.class_id = c.id AND s.school_id = c.school_id
       JOIN subjects sub ON s.subject_id = sub.id AND s.school_id = sub.school_id
       JOIN teachers t ON s.teacher_id = t.id AND s.school_id = t.school_id
-      WHERE r.school_id = $1
+      WHERE r.school_id = $1 AND s.status = 'submitted'
     `;
     const params: any[] = [schoolId];
 
@@ -509,5 +625,110 @@ export class AttendanceService {
 
     // Excel uchun UTF-8 BOM
     return '\uFEFF' + lines.join('\n');
+  }
+
+  /**
+   * Xavf ro'yxati (3 kun ketma-ket yo'q yoki 30 kunda <75%)
+   */
+  static async getRiskStudents(db: DbClient, schoolId: number) {
+    const today = getTodayInTashkent();
+    const d30 = new Date(today);
+    d30.setDate(d30.getDate() - 30);
+    const date30Str = d30.toISOString().slice(0, 10);
+
+    const recsRes = await db.query(
+      `SELECT r.student_id, r.status, s.date,
+              st.name as student_name, c.id as class_id, c.name as class_name
+       FROM attendance_records r
+       JOIN attendance_sessions s ON r.session_id = s.id AND r.school_id = s.school_id
+       JOIN students st ON r.student_id = st.id AND r.school_id = st.school_id
+       JOIN classes c ON st.class_id = c.id AND st.school_id = c.school_id
+       WHERE r.school_id = $1 AND s.status = 'submitted' AND s.date >= $2 AND s.date <= $3
+       ORDER BY s.date DESC, s.slot_no ASC`,
+      [schoolId, date30Str, today]
+    );
+
+    const studentData: Record<number, {
+      student_id: number;
+      student_name: string;
+      class_id: number;
+      class_name: string;
+      total: number;
+      absent: number;
+      dates: Map<string, { total: number; absent: number }>;
+    }> = {};
+
+    for (const r of recsRes.rows) {
+      if (!studentData[r.student_id]) {
+        studentData[r.student_id] = {
+          student_id: r.student_id,
+          student_name: r.student_name,
+          class_id: r.class_id,
+          class_name: r.class_name,
+          total: 0,
+          absent: 0,
+          dates: new Map(),
+        };
+      }
+      const sd = studentData[r.student_id];
+      sd.total++;
+      if (r.status === 'a') sd.absent++;
+
+      if (!sd.dates.has(r.date)) {
+        sd.dates.set(r.date, { total: 0, absent: 0 });
+      }
+      const dayData = sd.dates.get(r.date)!;
+      dayData.total++;
+      if (r.status === 'a') dayData.absent++;
+    }
+
+    const riskList: Array<{
+      student_id: number;
+      student_name: string;
+      class_id: number;
+      class_name: string;
+      reasons: string[];
+      pct: number;
+      consecutive_absent_days: number;
+    }> = [];
+
+    for (const sd of Object.values(studentData)) {
+      if (sd.total === 0) continue;
+      const pct = Math.round(((sd.total - sd.absent) / sd.total) * 100);
+      const reasons: string[] = [];
+
+      if (pct < 75) {
+        reasons.push('low_rate');
+      }
+
+      const sortedDates = Array.from(sd.dates.keys()).sort().reverse();
+      let consecutiveAbsent = 0;
+      for (const d of sortedDates) {
+        const dayStat = sd.dates.get(d)!;
+        if (dayStat.absent > 0 && dayStat.absent === dayStat.total) {
+          consecutiveAbsent++;
+        } else {
+          break;
+        }
+      }
+
+      if (consecutiveAbsent >= 3) {
+        reasons.push('consecutive_absent');
+      }
+
+      if (reasons.length > 0) {
+        riskList.push({
+          student_id: sd.student_id,
+          student_name: sd.student_name,
+          class_id: sd.class_id,
+          class_name: sd.class_name,
+          reasons,
+          pct,
+          consecutive_absent_days: consecutiveAbsent,
+        });
+      }
+    }
+
+    return riskList;
   }
 }

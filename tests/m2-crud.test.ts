@@ -4,6 +4,7 @@ import { buildApp } from '../src/app.js';
 import { createTestDb, DbClient } from '../src/db/client.js';
 import { AuthService } from '../src/modules/auth/auth.service.js';
 import { AuthUser } from '../src/modules/auth/permissions.js';
+import { hashSessionToken } from '../src/modules/auth/crypto.js';
 
 describe('M2: CRUD, biriktirish, jadval qoidalari, arxiv/o\'chirish', () => {
   let app: FastifyInstance;
@@ -392,5 +393,248 @@ describe('M2: CRUD, biriktirish, jadval qoidalari, arxiv/o\'chirish', () => {
       headers: { cookie: directorCookie },
     });
     expect(JSON.parse(schedRes.body).data.length).toBe(0);
+  });
+
+  it('8. Preset lavozimlar (GET /api/v1/positions): Maktab uchun barcha preset lavozimlar ro\'yxati qaytishi kerak', async () => {
+    const res = await app.inject({
+      method: 'GET',
+      url: '/api/v1/positions',
+      headers: { cookie: directorCookie },
+    });
+    expect(res.statusCode).toBe(200);
+    const positions = JSON.parse(res.body).data;
+    expect(positions.length).toBeGreaterThanOrEqual(12);
+
+    const keys = positions.map((p: any) => p.key);
+    expect(keys).toContain('director');
+    expect(keys).toContain('teacher');
+    expect(keys).toContain('deputy_academic');
+    expect(keys).toContain('deputy_edu');
+    expect(keys).toContain('nurse');
+    expect(keys).toContain('psychologist');
+    expect(keys).toContain('student');
+    expect(keys).toContain('parent');
+  });
+
+  it('9. Maxsus lavozim yaratish (POST /api/v1/positions) va privilege escalation dan himoya', async () => {
+    // A. O'zida yo'q ruxsatni berishga urinish rad etilishi kerak
+    const invalidRes = await app.inject({
+      method: 'POST',
+      url: '/api/v1/positions',
+      headers: { cookie: directorCookie },
+      payload: {
+        key: 'super_admin_fake',
+        name_uz: 'Soxta Super Admin',
+        base_key: 'admin',
+        scope: 'school',
+        permissions: ['MANAGE_PLATFORM'], // Direktor platforma boshqaruviga ega emas
+      },
+    });
+    expect(invalidRes.statusCode).toBe(403);
+    expect(JSON.parse(invalidRes.body).error).toContain('privilege escalation');
+
+    // B. Muvaffaqiyatli maxsus lavozim yaratish
+    const validRes = await app.inject({
+      method: 'POST',
+      url: '/api/v1/positions',
+      headers: { cookie: directorCookie },
+      payload: {
+        key: 'tutor',
+        name_uz: 'Tyutor / Murabbiy',
+        base_key: 'teacher',
+        scope: 'own_classes',
+        permissions: ['VIEW_STUDENTS', 'VIEW_REPORTS'],
+      },
+    });
+    expect(validRes.statusCode).toBe(200);
+    const created = JSON.parse(validRes.body).data;
+    expect(created.key).toBe('tutor');
+    expect(created.name_uz).toBe('Tyutor / Murabbiy');
+    expect(created.permissions).toContain('VIEW_STUDENTS');
+  });
+
+  it('10. Lavozim ruxsatlarini olish va yangilash (GET & PUT /api/v1/positions/:id/permissions)', async () => {
+    // Tyutor lavozimini topamiz
+    const listRes = await app.inject({
+      method: 'GET',
+      url: '/api/v1/positions',
+      headers: { cookie: directorCookie },
+    });
+    const positions = JSON.parse(listRes.body).data;
+    const tutorPos = positions.find((p: any) => p.key === 'tutor');
+    expect(tutorPos).toBeDefined();
+
+    // Ruxsatlarni olish
+    const getPermsRes = await app.inject({
+      method: 'GET',
+      url: `/api/v1/positions/${tutorPos.id}/permissions`,
+      headers: { cookie: directorCookie },
+    });
+    expect(getPermsRes.statusCode).toBe(200);
+
+    // Ruxsatlarni yangilash
+    const updateRes = await app.inject({
+      method: 'PUT',
+      url: `/api/v1/positions/${tutorPos.id}/permissions`,
+      headers: { cookie: directorCookie },
+      payload: { permissions: ['VIEW_STUDENTS', 'VIEW_REPORTS', 'EXPORT_DATA'] },
+    });
+    expect(updateRes.statusCode).toBe(200);
+
+    // Direktordan MANAGE_USERS ni olib tashlash taqiqlanishi kerak
+    const dirPos = positions.find((p: any) => p.key === 'director');
+    const demoteDirRes = await app.inject({
+      method: 'PUT',
+      url: `/api/v1/positions/${dirPos.id}/permissions`,
+      headers: { cookie: directorCookie },
+      payload: { permissions: ['VIEW_STUDENTS'] },
+    });
+    expect(demoteDirRes.statusCode).toBe(400);
+    expect(JSON.parse(demoteDirRes.body).error).toContain('MANAGE_USERS');
+  });
+
+  it('11. Foydalanuvchilar ro\'yxati (GET /api/v1/users) va xodim taklif qilish (POST /api/v1/users/invite)', async () => {
+    // Tyutor lavozimi ID sini olamiz
+    const listRes = await app.inject({
+      method: 'GET',
+      url: '/api/v1/positions',
+      headers: { cookie: directorCookie },
+    });
+    const tutorPos = JSON.parse(listRes.body).data.find((p: any) => p.key === 'tutor');
+
+    // Xodim taklif qilish
+    const inviteRes = await app.inject({
+      method: 'POST',
+      url: '/api/v1/users/invite',
+      headers: { cookie: directorCookie },
+      payload: {
+        phone: '+998901239988',
+        position_id: tutorPos.id,
+        full_name: 'Bobur Murabbiy',
+      },
+    });
+    expect(inviteRes.statusCode).toBe(200);
+    const inviteData = JSON.parse(inviteRes.body);
+    expect(inviteData.invite_link).toContain('t.me/EduMemoryBot?start=inv_');
+
+    // Ro'yxatda taklif etilgan xodim ko'rinishi va telegram_status pending bo'lishi kerak
+    const usersRes = await app.inject({
+      method: 'GET',
+      url: '/api/v1/users',
+      headers: { cookie: directorCookie },
+    });
+    expect(usersRes.statusCode).toBe(200);
+    const users = JSON.parse(usersRes.body).data;
+    const invitedUser = users.find((u: any) => u.phone_e164 === '+998901239988');
+    expect(invitedUser).toBeDefined();
+    expect(invitedUser.telegram_status).toBe('pending');
+  });
+
+  it('12. Kirish so\'rovlari (access-requests): join_code orqali so\'rov va direktor tasdig\'i', async () => {
+    // Maktabga join_code beramiz
+    await testDb.query("UPDATE schools SET join_code = 'PM_JOIN_2026' WHERE id = $1", [schoolId]);
+
+    // Yangi foydalanuvchi tizimga kiradi
+    const userRes = await testDb.query(
+      "INSERT INTO users (username, phone_e164, full_name, status) VALUES ($1, $2, $3, 'pending') RETURNING id",
+      ['+998903332211', '+998903332211', 'Sorovchi Ota-ona']
+    );
+    const requesterId = userRes.rows[0].id;
+
+    // Sessiya yaratamiz
+    const token = 'requester_test_token_123';
+    const tokenHash = hashSessionToken(token);
+    await testDb.query(
+      "INSERT INTO sessions (id, user_id, token_hash, expires_at) VALUES ($1, $2, $3, NOW() + INTERVAL '1 day')",
+      [tokenHash, requesterId, tokenHash]
+    );
+
+    // Foydalanuvchi join_code bilan kirish so'rovi yuboradi
+    const reqRes = await app.inject({
+      method: 'POST',
+      url: '/api/v1/access-requests',
+      headers: { authorization: `Bearer ${token}` },
+      payload: { join_code: 'PM_JOIN_2026', note: 'Farzandim 5-A da o\'qiydi' },
+    });
+    expect(reqRes.statusCode).toBe(200);
+    const reqData = JSON.parse(reqRes.body).data;
+
+    // Direktor kutilayotgan so'rovlarni ko'radi
+    const listRes = await app.inject({
+      method: 'GET',
+      url: '/api/v1/access-requests',
+      headers: { cookie: directorCookie },
+    });
+    expect(listRes.statusCode).toBe(200);
+    const pendingList = JSON.parse(listRes.body).data;
+    expect(pendingList.some((r: any) => r.id === reqData.id)).toBe(true);
+
+    // Direktor so'rovni tasdiqlaydi (parent lavozimi beradi)
+    const posRes = await app.inject({
+      method: 'GET',
+      url: '/api/v1/positions',
+      headers: { cookie: directorCookie },
+    });
+    const parentPos = JSON.parse(posRes.body).data.find((p: any) => p.key === 'parent');
+
+    const decideRes = await app.inject({
+      method: 'POST',
+      url: `/api/v1/access-requests/${reqData.id}/decide`,
+      headers: { cookie: directorCookie },
+      payload: { status: 'approved', position_id: parentPos.id },
+    });
+    expect(decideRes.statusCode).toBe(200);
+
+    // Foydalanuvchiga a'zolik berilganligini tekshirish
+    const memRes = await testDb.query(
+      'SELECT * FROM memberships WHERE user_id = $1 AND school_id = $2',
+      [requesterId, schoolId]
+    );
+    expect(memRes.rows.length).toBe(1);
+    expect(memRes.rows[0].position_id).toBe(parentPos.id);
+  });
+
+  it('13. Foydalanuvchini to\'xtatish (suspend) va sessiyalarni bekor qilish', async () => {
+    // Foydalanuvchini topamiz
+    const usersRes = await app.inject({
+      method: 'GET',
+      url: '/api/v1/users',
+      headers: { cookie: directorCookie },
+    });
+    const userToSuspend = JSON.parse(usersRes.body).data.find((u: any) => u.phone_e164 === '+998901239988');
+    expect(userToSuspend).toBeDefined();
+
+    // To'xtatish
+    const suspRes = await app.inject({
+      method: 'POST',
+      url: `/api/v1/users/${userToSuspend.id}/suspend`,
+      headers: { cookie: directorCookie },
+    });
+    expect(suspRes.statusCode).toBe(200);
+
+    // Baza holati: membership suspended
+    const mRes = await testDb.query(
+      'SELECT status FROM memberships WHERE user_id = $1 AND school_id = $2',
+      [userToSuspend.id, schoolId]
+    );
+    expect(mRes.rows[0].status).toBe('suspended');
+  });
+
+  it('14. Ruxsat va rol xavfsizligi: Begona maktab yoki direktorni pasaytirish taqiqlanadi', async () => {
+    // Direktor o'zini o'zi yoki o'zidan yuqori lavozimni pasaytira olmaydi
+    const dirUserRes = await testDb.query("SELECT id FROM users WHERE username = 'pm_director'");
+    const dirId = dirUserRes.rows[0].id;
+
+    const teacherPos = (await testDb.query("SELECT id FROM positions WHERE school_id = $1 AND key = 'teacher'", [schoolId])).rows[0];
+
+    // Direktorni o'qituvchiga pasaytirishga urinish
+    const demoteRes = await app.inject({
+      method: 'POST',
+      url: `/api/v1/users/${dirId}/position`,
+      headers: { cookie: directorCookie },
+      payload: { position_id: teacherPos.id },
+    });
+    // O'zidan yuqori yoki teng darajadagi direktorni boshqarish taqiqlanadi
+    expect(demoteRes.statusCode).toBe(403);
   });
 });

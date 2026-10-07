@@ -12,6 +12,7 @@ import {
   formatUzDate,
   composeAttendanceNotification,
 } from '../src/modules/telegram/telegram.service.js';
+import { hashPassword } from '../src/modules/auth/crypto.js';
 
 describe('M5: Telegram bot, ulash, xabarlar navbati', () => {
   let app: FastifyInstance;
@@ -330,5 +331,241 @@ describe('M5: Telegram bot, ulash, xabarlar navbati', () => {
     const blockedMsg = await testDb.query("SELECT status, error_text FROM outbox_messages WHERE date = '2026-10-06'");
     expect(blockedMsg.rows[0].status).toBe('failed');
     expect(blockedMsg.rows[0].error_text).toContain('blocked');
+  });
+
+  it('11. Feature 6-A: Ota-ona roziliksiz yoki begona o\'quvchiga ariza yubora olmasligi kerak va kunlik limit (<=3) ishlashi kerak', async () => {
+    // Ota-ona foydalanuvchisi yaratish
+    const pwHash = await hashPassword('ParentPass123!');
+    const pUserRes = await testDb.query(
+      `INSERT INTO users (school_id, username, password_hash, role, phone_e164, full_name, status)
+       VALUES ($1, 'parent_test', $2, 'parent', '+998901234567', 'Aliyev Ota', 'active')
+       RETURNING id`,
+      [schoolId, pwHash]
+    );
+    const parentUserId = pUserRes.rows[0].id;
+    const pPosRes = await testDb.query("SELECT id FROM positions WHERE school_id = $1 AND key = 'parent' LIMIT 1", [schoolId]);
+    await testDb.query(
+      `INSERT INTO memberships (user_id, school_id, position_id, status)
+       VALUES ($1, $2, $3, 'active')`,
+      [parentUserId, schoolId, pPosRes.rows[0].id]
+    );
+
+    const pLogin = await app.inject({
+      method: 'POST',
+      url: '/api/v1/auth/login',
+      payload: { username: 'parent_test', password: 'ParentPass123!' },
+    });
+    const parentCookie = pLogin.headers['set-cookie'] as string;
+
+    // 1. Bog'lanmagan o'quvchiga ariza yuborish -> 403
+    const resNoRel = await app.inject({
+      method: 'POST',
+      url: '/api/v1/excuse-requests',
+      headers: { cookie: parentCookie },
+      payload: {
+        student_id: student1Id,
+        date_from: '2026-10-05',
+        date_to: '2026-10-06',
+        reason: 'Kasallik',
+        note: 'Shamollash',
+      },
+    });
+    expect(resNoRel.statusCode).toBe(403);
+    expect(JSON.parse(resNoRel.body).error).toContain("faqat o'z farzandingiz");
+
+    // 2. Bog'lash lekin consent_at = NULL -> 403
+    await testDb.query(
+      `INSERT INTO parent_students (school_id, parent_user_id, student_id, consent_at)
+       VALUES ($1, $2, $3, NULL)`,
+      [schoolId, parentUserId, student1Id]
+    );
+    const resNoConsent = await app.inject({
+      method: 'POST',
+      url: '/api/v1/excuse-requests',
+      headers: { cookie: parentCookie },
+      payload: {
+        student_id: student1Id,
+        date_from: '2026-10-05',
+        date_to: '2026-10-06',
+        reason: 'Kasallik',
+        note: 'Shamollash',
+      },
+    });
+    expect(resNoConsent.statusCode).toBe(403);
+    expect(JSON.parse(resNoConsent.body).error).toContain('roziligi');
+
+    // 3. consent_at berilgandan so'ng muvaffaqiyatli ariza yaratiladi
+    await testDb.query(
+      `UPDATE parent_students SET consent_at = NOW() WHERE school_id = $1 AND parent_user_id = $2 AND student_id = $3`,
+      [schoolId, parentUserId, student1Id]
+    );
+
+    const resOk = await app.inject({
+      method: 'POST',
+      url: '/api/v1/excuse-requests',
+      headers: { cookie: parentCookie },
+      payload: {
+        student_id: student1Id,
+        date_from: '2026-10-05',
+        date_to: '2026-10-06',
+        reason: 'Kasallik',
+        note: 'Harorati bor',
+      },
+    });
+    expect(resOk.statusCode).toBe(200);
+    const okBody = JSON.parse(resOk.body);
+    expect(okBody.status).toBe('ok');
+    expect(okBody.data.status).toBe('pending');
+
+    // Sinf rahbariga xabar outbox ga tushgan bo'lishi kerak
+    const outboxLeader = await testDb.query(
+      `SELECT * FROM outbox_messages WHERE school_id = $1 AND text LIKE '%Yangi ariza%'`,
+      [schoolId]
+    );
+    expect(outboxLeader.rows.length).toBeGreaterThan(0);
+
+    // 4. Limit: yana 2 ta ariza yuborish (jami 3 ta)
+    await app.inject({
+      method: 'POST',
+      url: '/api/v1/excuse-requests',
+      headers: { cookie: parentCookie },
+      payload: { student_id: student1Id, date_from: '2026-10-07', date_to: '2026-10-07', reason: 'Oilaviy sabab' },
+    });
+    await app.inject({
+      method: 'POST',
+      url: '/api/v1/excuse-requests',
+      headers: { cookie: parentCookie },
+      payload: { student_id: student1Id, date_from: '2026-10-08', date_to: '2026-10-08', reason: 'Boshqa' },
+    });
+
+    // 4-marta urinish rad etilishi kerak (limit <= 3)
+    const resOverLimit = await app.inject({
+      method: 'POST',
+      url: '/api/v1/excuse-requests',
+      headers: { cookie: parentCookie },
+      payload: { student_id: student1Id, date_from: '2026-10-09', date_to: '2026-10-09', reason: 'Kasallik' },
+    });
+    expect(resOverLimit.statusCode).toBe(400);
+    expect(JSON.parse(resOverLimit.body).error).toContain("3 ta ariza");
+  });
+
+  it('12. Feature 6-A: Sinf rahbari arizani tasdiqlasa, o\'tgan davomatdagi "a" lar "e" ga (ariza#<id>) aylanadi va ota-onaga xabar boradi', async () => {
+    // Ariza yaratish: 2026-10-05 sanasi uchun (bu kunda 9-testda student1Id uchun 'a' qo'yilgan edi)
+    const pLogin = await app.inject({
+      method: 'POST',
+      url: '/api/v1/auth/login',
+      payload: { username: 'parent_test', password: 'ParentPass123!' },
+    });
+    const parentCookie = pLogin.headers['set-cookie'] as string;
+
+    // Tozalash: kunlik cheklovni chetlab o'tish uchun mavjud arizalarni tozalaymiz
+    await testDb.query('DELETE FROM excuse_requests WHERE school_id = $1', [schoolId]);
+
+    const createRes = await app.inject({
+      method: 'POST',
+      url: '/api/v1/excuse-requests',
+      headers: { cookie: parentCookie },
+      payload: {
+        student_id: student1Id,
+        date_from: '2026-10-05',
+        date_to: '2026-10-05',
+        reason: 'Kasallik',
+        note: 'Doktorga borgan',
+      },
+    });
+    expect(createRes.statusCode).toBe(200);
+    const reqId = JSON.parse(createRes.body).data.id;
+
+    // Sinf rahbari (teacherCookie) arizani tasdiqlaydi
+    const decideRes = await app.inject({
+      method: 'POST',
+      url: `/api/v1/excuse-requests/${reqId}/decide`,
+      headers: { cookie: teacherCookie },
+      payload: { action: 'approve' },
+    });
+    expect(decideRes.statusCode).toBe(200);
+    expect(JSON.parse(decideRes.body).data.status).toBe('approved');
+
+    // 2026-10-05 dagi 'a' davomat rekordi 'e' bo'lganini tekshiramiz
+    const recRes = await testDb.query(
+      `SELECT r.status FROM attendance_records r
+       JOIN attendance_sessions s ON r.session_id = s.id
+       WHERE r.school_id = $1 AND r.student_id = $2 AND s.date = '2026-10-05'`,
+      [schoolId, student1Id]
+    );
+    expect(recRes.rows[0].status).toBe('e');
+
+    // attendance_excuses jadvalida source = 'ariza#<id>' bo'lishi kerak
+    const excRes = await testDb.query(
+      `SELECT * FROM attendance_excuses WHERE school_id = $1 AND student_id = $2 AND date = '2026-10-05'`,
+      [schoolId, student1Id]
+    );
+    expect(excRes.rows.length).toBe(1);
+    expect(excRes.rows[0].source).toBe(`ariza#${reqId}`);
+    expect(excRes.rows[0].reason).toBe('Kasallik');
+
+    // Ota-onaga qaror haqida bildirishnoma outbox_messages da bo'lishi kerak
+    const pNotify = await testDb.query(
+      `SELECT * FROM outbox_messages WHERE school_id = $1 AND text LIKE '%qabul qilindi%'`,
+      [schoolId]
+    );
+    expect(pNotify.rows.length).toBeGreaterThan(0);
+  });
+
+  it('13. Feature 6-A: Tasdiqlangan ariza sanasi uchun o\'qituvchi kelajakda "a" qo\'ysa avtomatik "e" ga aylanadi va audit yoziladi', async () => {
+    // Kelajak/keyingi sana uchun tasdiqlangan ariza yaratamiz: bugungi kun
+    const today = new Date().toISOString().slice(0, 10);
+
+    const insReq = await testDb.query(
+      `INSERT INTO excuse_requests (school_id, student_id, parent_user_id, date_from, date_to, reason, note, status)
+       VALUES ($1, $2, (SELECT id FROM users WHERE username = 'parent_test'), $3, $3, 'Oilaviy sabab', $4, 'approved')
+       RETURNING id`,
+      [schoolId, student1Id, today, "To'y"]
+    );
+    const excuseReqId = insReq.rows[0].id;
+
+    // Dars slotini bugungi haftaning kuniga to'g'rilash yoki mavjud slot bilan saqlash
+    const authUser: AuthUser = { id: teacherUserId, school_id: schoolId, username: 'teacher_m5', role: 'teacher', teacher_id: teacherId };
+
+    // O'qituvchi student1Id ga 'a' (yo'q) deb saqlaydi
+    await AttendanceService.saveSessionAttendance(
+      testDb,
+      schoolId,
+      slotId,
+      today,
+      {
+        version: 0,
+        records: {
+          [student1Id]: 'a',
+          [student2Id]: 'p',
+        },
+      },
+      authUser
+    );
+
+    // Rekord avtomatik 'e' ga aylangan bo'lishi kerak
+    const recRes = await testDb.query(
+      `SELECT r.status FROM attendance_records r
+       JOIN attendance_sessions s ON r.session_id = s.id
+       WHERE r.school_id = $1 AND r.student_id = $2 AND s.date = $3`,
+      [schoolId, student1Id, today]
+    );
+    expect(recRes.rows[0].status).toBe('e');
+
+    // attendance_excuses da source = ariza#<id> bo'lishi kerak
+    const excRes = await testDb.query(
+      `SELECT * FROM attendance_excuses WHERE school_id = $1 AND student_id = $2 AND date = $3`,
+      [schoolId, student1Id, today]
+    );
+    expect(excRes.rows.length).toBe(1);
+    expect(excRes.rows[0].source).toBe(`ariza#${excuseReqId}`);
+
+    // Audit log da ATTENDANCE_AUTO_EXCUSED qayd qilingan bo'lishi kerak
+    const auditRes = await testDb.query(
+      `SELECT * FROM audit_log WHERE school_id = $1 AND action = 'ATTENDANCE_AUTO_EXCUSED'`,
+      [schoolId]
+    );
+    expect(auditRes.rows.length).toBeGreaterThan(0);
+    expect(auditRes.rows[0].details.source).toBe(`ariza#${excuseReqId}`);
   });
 });

@@ -3,7 +3,9 @@ import { z } from 'zod';
 import { BootstrapService } from './bootstrap.service.js';
 import { AuthService } from '../auth/auth.service.js';
 import { can, ALL_PERMISSIONS } from '../auth/permissions.js';
+import crypto from 'crypto';
 import { DbClient } from '../../db/client.js';
+import { normalizePhone } from '../auth/telegram.validator.js';
 import { seedXatirchiSchool } from '../school/xatirchi.seed.js';
 
 async function getAuth(request: FastifyRequest, db: DbClient) {
@@ -214,28 +216,244 @@ export async function bootstrapRoutes(app: FastifyInstance) {
     return reply.send({ status: 'ok', data: res.rows });
   });
 
-  // 7. Foydalanuvchilar boshqaruvi (Users)
+  // 7. Foydalanuvchilar boshqaruvi (Users - EduMemory 3.0 MAX)
   app.get('/api/v1/users', async (request: FastifyRequest, reply: FastifyReply) => {
     const auth = await getAuth(request, db);
-    if (!auth) return reply.status(401).send({ error: 'Avtorizatsiya talab qilinadi' });
+    if (!auth) return reply.status(401).send({ error: "Avtorizatsiya talab qilinadi" });
     const schoolId = getEffectiveSchoolId(auth.user);
 
-    if (!['owner', 'director', 'admin'].includes(auth.user.role)) {
-      return reply.status(403).send({ error: 'Ruxsat yo\'q' });
+    if (!can(auth.user, 'MANAGE_USERS', undefined, { permissions: auth.permissions }) &&
+        !['owner', 'director', 'admin'].includes(auth.user.role)) {
+      return reply.status(403).send({ error: "Foydalanuvchilarni ko'rish huquqi yo'q" });
     }
 
+    const hasViewContacts = can(auth.user, 'VIEW_CONTACTS', undefined, { permissions: auth.permissions }) ||
+      ['owner', 'director'].includes(auth.user.role);
+
     const res = await db.query(
-      `SELECT u.id, u.username, u.role, u.teacher_id, u.student_id, u.must_change_password, u.locked_until, u.created_at,
+      `SELECT u.id, u.username, u.role, u.phone_e164, u.full_name, u.status as user_status,
+              u.teacher_id, u.student_id, u.must_change_password, u.locked_until, u.created_at,
+              m.id as membership_id, m.status as membership_status,
+              p.id as position_id, p.key as position_key, p.name_uz as position_name, p.rank,
+              ti.telegram_id, ti.phone_verified_at,
               t.name as teacher_name, st.name as student_name
        FROM users u
+       LEFT JOIN memberships m ON m.user_id = u.id AND (m.school_id = $1 OR m.school_id IS NULL)
+       LEFT JOIN positions p ON m.position_id = p.id
+       LEFT JOIN telegram_identities ti ON ti.user_id = u.id AND ti.unbound_at IS NULL
        LEFT JOIN teachers t ON u.teacher_id = t.id AND u.school_id = t.school_id
        LEFT JOIN students st ON u.student_id = st.id AND u.school_id = st.school_id
-       WHERE u.school_id = $1
+       WHERE u.school_id = $1 OR m.school_id = $1
        ORDER BY u.id ASC`,
       [schoolId]
     );
 
-    return reply.send({ status: 'ok', data: res.rows });
+    const rows = res.rows.map((row: any) => {
+      // Telegram status hisoblash
+      let telegram_status: 'connected' | 'pending' | 'disconnected' = 'disconnected';
+      if (row.phone_verified_at) {
+        telegram_status = 'connected';
+      } else if (row.membership_status === 'invited' || row.user_status === 'pending') {
+        telegram_status = 'pending';
+      }
+
+      // Telefon raqamni maskalash (Section 5.3 VIEW_CONTACTS ruxsati bo'lmasa)
+      let phone = row.phone_e164 || row.username || '';
+      if (!hasViewContacts && phone) {
+        const digits = phone.replace(/\D/g, '');
+        if (digits.length >= 9) {
+          const start = digits.slice(0, 5);
+          const end = digits.slice(-2);
+          phone = `+${start.slice(0, 3)} ${start.slice(3, 5)} *** ** ${end}`;
+        } else {
+          phone = '***';
+        }
+      }
+
+      return {
+        ...row,
+        phone,
+        telegram_status,
+      };
+    });
+
+    return reply.send({ status: 'ok', data: rows });
+  });
+
+  // Taklif yuborish (Xodim taklifi: raqam + lavozim)
+  app.post('/api/v1/users/invite', async (request: FastifyRequest, reply: FastifyReply) => {
+    const auth = await getAuth(request, db);
+    if (!auth) return reply.status(401).send({ error: "Avtorizatsiya talab qilinadi" });
+
+    if (!can(auth.user, 'MANAGE_USERS', undefined, { permissions: auth.permissions })) {
+      return reply.status(403).send({ error: "Foydalanuvchi taklif qilish huquqi yo'q" });
+    }
+
+    const schoolId = getEffectiveSchoolId(auth.user);
+    if (!schoolId) return reply.status(400).send({ error: "Maktab aniqlanmadi" });
+
+    const schema = z.object({
+      phone: z.string().min(5, 'Telefon raqamni kiriting'),
+      position_id: z.coerce.number().int().positive('Lavozim tanlanishi shart'),
+      full_name: z.string().optional(),
+    });
+    const parsed = schema.safeParse(request.body);
+    if (!parsed.success) return reply.status(400).send({ error: parsed.error.errors[0].message });
+
+    const normPhone = normalizePhone(parsed.data.phone);
+
+    // Lavozim tekshiruvi (Section 5.5: o'zidan yuqori lavozim berilmaydi)
+    const posRes = await db.query('SELECT id, key, rank FROM positions WHERE id = $1', [parsed.data.position_id]);
+    if (posRes.rows.length === 0) return reply.status(404).send({ error: "Lavozim topilmadi" });
+    const targetPos = posRes.rows[0];
+
+    const myRank = auth.user.rank || 10;
+    if (targetPos.rank < myRank) {
+      return reply.status(403).send({ error: "O'zingizdan yuqori darajali lavozim bera olmaysiz" });
+    }
+
+    // Foydalanuvchini topish yoki yaratish
+    let userRes = await db.query('SELECT id FROM users WHERE phone_e164 = $1 LIMIT 1', [normPhone]);
+    let userId: number;
+    if (userRes.rows.length > 0) {
+      userId = userRes.rows[0].id;
+    } else {
+      const insU = await db.query(
+        `INSERT INTO users (school_id, username, phone_e164, full_name, role, status)
+         VALUES ($1, $2, $2, $3, $4, 'pending')
+         RETURNING id`,
+        [schoolId, normPhone, parsed.data.full_name || 'Yangi xodim', targetPos.key]
+      );
+      userId = insU.rows[0].id;
+    }
+
+    // Taklif kodi (bir martalik, 7 kun)
+    const rawCode = crypto.randomBytes(16).toString('hex');
+    const codeHash = crypto.createHash('sha256').update(rawCode).digest('hex');
+    const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
+
+    const mRes = await db.query(
+      `INSERT INTO memberships (user_id, school_id, position_id, status, invited_phone, invited_by, invite_code_hash, invite_expires_at)
+       VALUES ($1, $2, $3, 'invited', $4, $5, $6, $7)
+       RETURNING id`,
+      [userId, schoolId, targetPos.id, normPhone, auth.user.id, codeHash, expiresAt.toISOString()]
+    );
+
+    const inviteLink = `https://t.me/EduMemoryBot?start=inv_${rawCode}`;
+    return reply.send({
+      status: 'ok',
+      message: "Taklif muvaffaqiyatli yaratildi",
+      membership_id: mRes.rows[0].id,
+      invite_link: inviteLink,
+      expires_at: expiresAt.toISOString(),
+    });
+  });
+
+  // Lavozimni almashtirish (POST /api/v1/users/:id/position)
+  app.post('/api/v1/users/:id/position', async (request: FastifyRequest<{ Params: { id: string } }>, reply: FastifyReply) => {
+    const auth = await getAuth(request, db);
+    if (!auth) return reply.status(401).send({ error: "Avtorizatsiya talab qilinadi" });
+
+    if (!can(auth.user, 'MANAGE_USERS', undefined, { permissions: auth.permissions })) {
+      return reply.status(403).send({ error: "Lavozim almashtirish huquqi yo'q" });
+    }
+
+    const schoolId = getEffectiveSchoolId(auth.user);
+    const targetUserId = parseInt(request.params.id, 10);
+
+    const schema = z.object({
+      position_id: z.coerce.number().int().positive('Yangi lavozim tanlanishi shart'),
+    });
+    const parsed = schema.safeParse(request.body);
+    if (!parsed.success) return reply.status(400).send({ error: parsed.error.errors[0].message });
+
+    // Target user tekshiruvi: oxirgi director yoki owner pasaytirilmaydi
+    const targetUserRes = await db.query('SELECT id, role FROM users WHERE id = $1', [targetUserId]);
+    if (targetUserRes.rows.length === 0) return reply.status(404).send({ error: "Foydalanuvchi topilmadi" });
+    const targetUser = targetUserRes.rows[0];
+
+    if (targetUser.role === 'owner') {
+      return reply.status(403).send({ error: "Owner lavozimini o'zgartirish taqiqlanadi" });
+    }
+
+    const posRes = await db.query('SELECT id, key, rank FROM positions WHERE id = $1', [parsed.data.position_id]);
+    if (posRes.rows.length === 0) return reply.status(404).send({ error: "Lavozim topilmadi" });
+    const targetPos = posRes.rows[0];
+
+    // Section 5.5: Oxirgi director pasaytirilmaydi
+    if (targetUser.role === 'director' && targetPos.key !== 'director') {
+      const dirCount = await db.query(
+        "SELECT COUNT(*) as count FROM users WHERE school_id = $1 AND role = 'director'",
+        [schoolId]
+      );
+      if (parseInt(dirCount.rows[0].count, 10) <= 1) {
+        return reply.status(403).send({ error: "Maktabning yagona direktorini pasaytirish taqiqlanadi" });
+      }
+    }
+
+    const myRank = auth.user.rank || 10;
+    if (targetPos.rank < myRank) {
+      return reply.status(403).send({ error: "O'zingizdan yuqori darajali lavozim bera olmaysiz" });
+    }
+
+    // Yangilash
+    await db.query(
+      'UPDATE memberships SET position_id = $1 WHERE user_id = $2 AND school_id = $3',
+      [targetPos.id, targetUserId, schoolId]
+    );
+    await db.query('UPDATE users SET role = $1 WHERE id = $2', [targetPos.key, targetUserId]);
+
+    // Sessiyalarni bekor qilish (yangilangan lavozim kuchga kirishi uchun)
+    await db.query('DELETE FROM sessions WHERE user_id = $1', [targetUserId]);
+
+    return reply.send({ status: 'ok', message: "Lavozim yangilandi va sessiyalar qayta tiklashga tayyorlandi" });
+  });
+
+  // Foydalanuvchini to'xtatish (suspend)
+  app.post('/api/v1/users/:id/suspend', async (request: FastifyRequest<{ Params: { id: string } }>, reply: FastifyReply) => {
+    const auth = await getAuth(request, db);
+    if (!auth) return reply.status(401).send({ error: "Avtorizatsiya talab qilinadi" });
+
+    if (!can(auth.user, 'MANAGE_USERS', undefined, { permissions: auth.permissions })) {
+      return reply.status(403).send({ error: "Foydalanuvchini to'xtatish huquqi yo'q" });
+    }
+
+    const schoolId = getEffectiveSchoolId(auth.user);
+    const targetUserId = parseInt(request.params.id, 10);
+
+    const targetUserRes = await db.query('SELECT id, role FROM users WHERE id = $1', [targetUserId]);
+    if (targetUserRes.rows.length === 0) return reply.status(404).send({ error: "Foydalanuvchi topilmadi" });
+
+    if (targetUserRes.rows[0].role === 'owner') {
+      return reply.status(403).send({ error: "Platforma egasini to'xtatish taqiqlanadi" });
+    }
+
+    await db.query(
+      "UPDATE memberships SET status = 'suspended' WHERE user_id = $1 AND school_id = $2",
+      [targetUserId, schoolId]
+    );
+    await db.query('DELETE FROM sessions WHERE user_id = $1', [targetUserId]);
+
+    return reply.send({ status: 'ok', message: "Foydalanuvchi hisobi to'xtatildi va faol sessiyalar bekor qilindi" });
+  });
+
+  // Admin tomonidan Telegramni uzish
+  app.delete('/api/v1/users/:id/telegram', async (request: FastifyRequest<{ Params: { id: string } }>, reply: FastifyReply) => {
+    const auth = await getAuth(request, db);
+    if (!auth) return reply.status(401).send({ error: "Avtorizatsiya talab qilinadi" });
+
+    if (!can(auth.user, 'MANAGE_USERS', undefined, { permissions: auth.permissions })) {
+      return reply.status(403).send({ error: "Telegramni uzish huquqi yo'q" });
+    }
+
+    const targetUserId = parseInt(request.params.id, 10);
+    await db.query(
+      'UPDATE telegram_identities SET unbound_at = NOW(), user_id = NULL WHERE user_id = $1',
+      [targetUserId]
+    );
+    await db.query('DELETE FROM sessions WHERE user_id = $1', [targetUserId]);
+
+    return reply.send({ status: 'ok', message: "Telegram profili uzildi" });
   });
 
   app.post('/api/v1/users', async (request: FastifyRequest, reply: FastifyReply) => {
