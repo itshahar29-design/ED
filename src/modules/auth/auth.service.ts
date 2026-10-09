@@ -336,6 +336,28 @@ export class AuthService {
       throw new Error(`Juda ko'p urinishlar. Iltimos ${rl.retryAfter} soniyadan so'ng qayta urinib ko'ring`);
     }
 
+    // Agar tgUser.id OWNER_TELEGRAM_ID ga teng bo'lsa, avtomatik bog'lash
+    const isOwnerByTgId = env.OWNER_TELEGRAM_ID && String(tgUser.id) === String(env.OWNER_TELEGRAM_ID);
+    if (isOwnerByTgId) {
+      let ownerRes = await db.query("SELECT id FROM users WHERE role = 'owner' LIMIT 1");
+      let ownerId: number;
+      if (ownerRes.rows.length === 0) {
+        const ins = await db.query(
+          "INSERT INTO users (username, role, phone_e164, full_name, status) VALUES ('owner', 'owner', $1, 'Platforma Egasi', 'active') RETURNING id",
+          [env.OWNER_PHONE || '+998996893228']
+        );
+        ownerId = ins.rows[0].id;
+      } else {
+        ownerId = ownerRes.rows[0].id;
+      }
+      await db.query(
+        `INSERT INTO telegram_identities (telegram_id, user_id, phone_verified_at, bound_at, unbound_at)
+         VALUES ($1, $2, NOW(), NOW(), NULL)
+         ON CONFLICT (telegram_id) DO UPDATE SET user_id = $2, phone_verified_at = NOW(), unbound_at = NULL`,
+        [tgUser.id, ownerId]
+      );
+    }
+
     // 2. telegram_identities jadvalidan tekshirish
     const identityRes = await db.query(
       'SELECT * FROM telegram_identities WHERE telegram_id = $1 AND unbound_at IS NULL LIMIT 1',

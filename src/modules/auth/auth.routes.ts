@@ -183,14 +183,10 @@ export async function authRoutes(app: FastifyInstance) {
       const ip = request.ip;
       let result;
 
-      const phoneInput = parsed.data.phone || (!parsed.data.password ? parsed.data.username : undefined);
-
-      if (phoneInput) {
-        result = await AuthService.loginByPhone(db, phoneInput, ip);
-      } else if (parsed.data.username && parsed.data.password) {
+      if (parsed.data.username && parsed.data.password) {
         result = await AuthService.login(db, parsed.data.username, parsed.data.password, ip);
       } else {
-        return reply.status(400).send({ error: 'Telefon raqamingizni kiriting' });
+        return reply.status(401).send({ error: "Xavfsizlik talabi: Tizimga kirish faqat Telegram bot orqali amalga oshiriladi" });
       }
 
       reply.setCookie('sessionId', result.sessionToken, {

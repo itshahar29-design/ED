@@ -333,9 +333,12 @@ export function initBot(db: DbClient): Bot | null {
       const directUrl = boundResult?.sessionToken
         ? `${webAppUrl}/api/v1/auth/direct-login?token=${boundResult.sessionToken}`
         : webAppUrl;
+      const appWithToken = boundResult?.sessionToken
+        ? `${webAppUrl}/?token=${boundResult.sessionToken}`
+        : webAppUrl;
 
       const inline = new InlineKeyboard()
-        .webApp('🚀 Saytga kirish (Mini App)', webAppUrl)
+        .webApp('🚀 Saytga kirish (Mini App)', appWithToken)
         .row()
         .url('🌐 Brauzerda ochish (Avto-kirish)', directUrl);
 
