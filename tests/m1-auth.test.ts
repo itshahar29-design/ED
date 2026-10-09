@@ -488,4 +488,73 @@ describe('M1: Auth, rollar, ko\'p maktab, RLS, can(), audit', () => {
     });
     expect(meRes.statusCode).toBe(401);
   });
+
+  it('19. Noma\'lum va soxta loginlar (hacker, demo_fake, +998990001122) rad etilishi kerak', async () => {
+    const demoLogins = [
+      { username: 'hacker', password: 'admin123' },
+      { username: 'demo_fake_account', password: 'password123' },
+      { username: 'unknown_teacher', password: 'Teacher123!' },
+      { phone: '+998990001122' },
+    ];
+
+    for (const payload of demoLogins) {
+      const res = await app.inject({
+        method: 'POST',
+        url: '/api/v1/auth/login',
+        payload,
+      });
+      expect(res.statusCode).toBe(401);
+    }
+  });
+
+  it('20. Owner foydalanuvchisini o\'chirish, bloklash yoki rolini pasaytirish qat\'iyan taqiqlanishi kerak (403)', async () => {
+    const ownerRes = await testDb.query("SELECT id, username FROM users WHERE role = 'owner' LIMIT 1");
+    const ownerId = ownerRes.rows[0].id;
+    await testDb.query("UPDATE users SET failed_logins = 0, locked_until = NULL WHERE id = $1", [ownerId]);
+
+    const ownerLogin = await app.inject({
+      method: 'POST',
+      url: '/api/v1/auth/login',
+      payload: { username: ownerRes.rows[0].username, password: 'NewOwnerPassword123!' },
+    });
+    expect(ownerLogin.statusCode).toBe(200);
+    const { sessionToken } = JSON.parse(ownerLogin.body);
+
+    // 1. Owner'ni o'chirishga urinish
+    const delRes = await app.inject({
+      method: 'DELETE',
+      url: `/api/v1/users/${ownerId}`,
+      headers: { authorization: `Bearer ${sessionToken}` },
+    });
+    expect(delRes.statusCode).toBe(403);
+    expect(JSON.parse(delRes.body).error).toContain('taqiqlan');
+
+    // 2. Owner rolini pasaytirishga urinish
+    const roleRes = await app.inject({
+      method: 'PUT',
+      url: `/api/v1/owner/users/${ownerId}/role`,
+      headers: { authorization: `Bearer ${sessionToken}` },
+      payload: { role: 'teacher' },
+    });
+    expect(roleRes.statusCode).toBe(403);
+
+    // 3. Owner'ni bloklashga urinish
+    const statusRes = await app.inject({
+      method: 'PUT',
+      url: `/api/v1/owner/users/${ownerId}/status`,
+      headers: { authorization: `Bearer ${sessionToken}` },
+      payload: { status: 'blocked' },
+    });
+    expect(statusRes.statusCode).toBe(403);
+
+    // 4. Broadcast yuborish
+    const bcastRes = await app.inject({
+      method: 'POST',
+      url: '/api/v1/owner/broadcast',
+      headers: { authorization: `Bearer ${sessionToken}` },
+      payload: { text: 'Test broadcast xabarnoma', target: 'all' },
+    });
+    expect(bcastRes.statusCode).toBe(200);
+    expect(JSON.parse(bcastRes.body).status).toBe('ok');
+  });
 });

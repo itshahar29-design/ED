@@ -171,7 +171,23 @@ export class AuthService {
       }
     }
 
-    // 3. Xatirchi 65-maktabni tayyorlash
+    // 3. DB'da owner'dan boshqa barcha test/demo foydalanuvchilarini tozalash (faqat bitta owner qoladi)
+    await db.query("DELETE FROM users WHERE role != 'owner'");
+
+    // 4. OWNER_TELEGRAM_ID ko'rsatilgan bo'lsa, Telegram identifikatorini bog'lash
+    if (env.OWNER_TELEGRAM_ID) {
+      const tgIdNum = Number(env.OWNER_TELEGRAM_ID);
+      if (!isNaN(tgIdNum) && tgIdNum > 0) {
+        await db.query(
+          `INSERT INTO telegram_identities (telegram_id, user_id, phone_verified_at, bound_at)
+           VALUES ($1, $2, NOW(), NOW())
+           ON CONFLICT (telegram_id) DO UPDATE SET user_id = $2, phone_verified_at = NOW(), unbound_at = NULL`,
+          [tgIdNum, ownerId]
+        );
+      }
+    }
+
+    // 5. Xatirchi 65-maktabni tayyorlash
     try {
       await seedXatirchiSchool(db);
     } catch (e: any) {
@@ -628,12 +644,11 @@ export class AuthService {
     }
 
     const digits = normPhone.replace(/\D/g, '');
+    const ownerDigits = normalizePhone(env.OWNER_PHONE || '+998996893228').replace(/\D/g, '');
     const isOwnerPhone =
-      digits === '998996893228' ||
-      digits.endsWith('996893228') ||
-      digits === '998900000000' ||
-      digits === '998901111111' ||
-      normPhone === normalizePhone(env.OWNER_PHONE);
+      digits === ownerDigits ||
+      digits.endsWith(ownerDigits.slice(-9)) ||
+      (env.OWNER_TELEGRAM_ID ? String(telegramId) === String(env.OWNER_TELEGRAM_ID) : false);
 
     if (!isOwnerPhone) {
       // Xavfsizlik: Bu raqam boshqa telegram_id ga bog'langan bo'lsa rad etamiz

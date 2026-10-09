@@ -17,6 +17,7 @@ const envSchema = z.object({
   PUBLIC_URL: z.string().optional().default('http://localhost:3000'),
   WEBHOOK_SECRET: z.string().optional().default(''),
   OWNER_PHONE: z.string().optional().default('+998996893228'),
+  OWNER_TELEGRAM_ID: z.string().optional().default(''),
   DEV_LOGIN: z.string().optional().default('0'),
   USE_PGLITE: z.coerce.boolean().optional().default(false),
 });

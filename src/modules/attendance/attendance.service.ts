@@ -99,7 +99,7 @@ export class AttendanceService {
     ipAddress?: string
   ) {
     const today = getTodayInTashkent();
-    if (date > today) {
+    if (date > today && user.role !== 'owner') {
       throw new Error('Kelajak sanaga davomat yozib bo\'lmaydi');
     }
 
@@ -318,7 +318,7 @@ export class AttendanceService {
     ipAddress?: string
   ) {
     const today = getTodayInTashkent();
-    if (date > today) {
+    if (date > today && user.role !== 'owner') {
       throw new Error('Kelajak sanaga davomat yozib bo\'lmaydi');
     }
 
@@ -369,7 +369,7 @@ export class AttendanceService {
     ipAddress?: string
   ) {
     const today = getTodayInTashkent();
-    if (input.date > today) {
+    if (input.date > today && user.role !== 'owner') {
       throw new Error('Kelajak kunga sababli qo\'yib bo\'lmaydi');
     }
 

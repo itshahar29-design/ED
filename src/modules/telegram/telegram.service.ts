@@ -323,13 +323,10 @@ export class TelegramService {
     const last9 = digits.slice(-9);
 
     // 1. Owner / Superadmin tekshirish
+    const ownerDigits = normalizePhone(env.OWNER_PHONE || '+998996893228').replace(/\D/g, '');
     if (
-      digits === '998900000000' ||
-      digits === '998901111111' ||
-      digits === '998996893228' ||
-      digits.endsWith('996893228') ||
-      digits.includes('996893228') ||
-      (env.OWNER_PHONE && digits === normalizePhone(env.OWNER_PHONE).replace(/\D/g, '')) ||
+      digits === ownerDigits ||
+      digits.endsWith(ownerDigits.slice(-9)) ||
       rawPhone.toLowerCase() === 'owner'
     ) {
       return {

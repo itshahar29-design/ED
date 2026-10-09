@@ -7,6 +7,8 @@ import crypto from 'crypto';
 import { DbClient } from '../../db/client.js';
 import { normalizePhone } from '../auth/telegram.validator.js';
 import { seedXatirchiSchool } from '../school/xatirchi.seed.js';
+import { hashPassword, generateTempPassword, hashSessionToken } from '../auth/crypto.js';
+import { logAudit } from '../audit/audit.service.js';
 
 async function getAuth(request: FastifyRequest, db: DbClient) {
   const token = request.cookies.sessionId || request.headers.authorization?.replace('Bearer ', '');
@@ -16,12 +18,9 @@ async function getAuth(request: FastifyRequest, db: DbClient) {
 
 function getEffectiveSchoolId(user: any): number {
   if (user.role === 'owner') {
-    if (!user.support_school_id) {
-      throw new Error('Platforma egasi (owner) uchun avval yordam rejimida maktab tanlanishi shart');
-    }
-    return user.support_school_id;
+    return user.support_school_id || user.school_id || 1;
   }
-  if (!user.school_id) throw new Error('Maktab aniqlanmadi');
+  if (!user.school_id) return 1;
   return user.school_id;
 }
 
@@ -481,6 +480,11 @@ export async function bootstrapRoutes(app: FastifyInstance) {
     const auth = await getAuth(request, db);
     if (!auth) return reply.status(401).send({ error: 'Avtorizatsiya talab qilinadi' });
 
+    const targetUser = await db.query('SELECT role FROM users WHERE id = $1', [request.params.id]);
+    if (targetUser.rows[0]?.role === 'owner') {
+      return reply.status(403).send({ error: "Platforma egasini (owner) o'chirish qat'iyan taqiqlanadi" });
+    }
+
     try {
       await AuthService.deleteUser(db, auth.user, Number(request.params.id), request.ip);
       return reply.send({ status: 'ok', message: 'Foydalanuvchi o\'chirildi' });
@@ -548,5 +552,255 @@ export async function bootstrapRoutes(app: FastifyInstance) {
     } catch (err: any) {
       return reply.status(400).send({ error: err.message });
     }
+  });
+
+  // 10. OWNER SUPERADMIN APIS (Cheksiz imkoniyatlar)
+  // Global tizim ko'rsatkichlari va barcha maktablar
+  app.get('/api/v1/owner/overview', async (request: FastifyRequest, reply: FastifyReply) => {
+    const auth = await getAuth(request, db);
+    if (!auth || auth.user.role !== 'owner') {
+      return reply.status(403).send({ error: 'Faqat platforma egasi (owner) uchun' });
+    }
+
+    const schoolsRes = await db.query(
+      `SELECT s.id, s.name, s.code, s.status, s.created_at,
+              (SELECT COUNT(*) FROM students st WHERE st.school_id = s.id AND st.status = 'a') as student_count,
+              (SELECT COUNT(*) FROM teachers t WHERE t.school_id = s.id AND t.status = 'a') as teacher_count,
+              (SELECT COUNT(*) FROM classes c WHERE c.school_id = s.id AND c.status = 'a') as class_count,
+              (SELECT COUNT(*) FROM subjects sub WHERE sub.school_id = s.id AND sub.status = 'a') as subject_count,
+              (SELECT u.username FROM users u WHERE u.school_id = s.id AND u.role = 'director' LIMIT 1) as director_username,
+              (SELECT u.phone_e164 FROM users u WHERE u.school_id = s.id AND u.role = 'director' LIMIT 1) as director_phone
+       FROM schools s ORDER BY s.id ASC`
+    );
+
+    const statsRes = await db.query(`
+      SELECT
+        (SELECT COUNT(*) FROM schools) as total_schools,
+        (SELECT COUNT(*) FROM users) as total_users,
+        (SELECT COUNT(*) FROM teachers WHERE status = 'a') as total_teachers,
+        (SELECT COUNT(*) FROM students WHERE status = 'a') as total_students,
+        (SELECT COUNT(*) FROM classes WHERE status = 'a') as total_classes,
+        (SELECT COUNT(*) FROM subjects WHERE status = 'a') as total_subjects
+    `);
+
+    return reply.send({
+      status: 'ok',
+      data: {
+        stats: statsRes.rows[0],
+        schools: schoolsRes.rows,
+      },
+    });
+  });
+
+  // Maktab ma'lumotlarini tozalash (Wipe school data)
+  app.post('/api/v1/owner/wipe-school-data', async (request: FastifyRequest<{ Body: { school_id?: number } }>, reply: FastifyReply) => {
+    const auth = await getAuth(request, db);
+    if (!auth || auth.user.role !== 'owner') {
+      return reply.status(403).send({ error: 'Faqat platforma egasi (owner) uchun' });
+    }
+
+    const targetSchoolId = request.body?.school_id || auth.user.support_school_id || (await db.query('SELECT id FROM schools LIMIT 1')).rows[0]?.id;
+    if (!targetSchoolId) return reply.status(400).send({ error: 'Maktab topilmadi' });
+
+    await db.query("DELETE FROM users WHERE school_id = $1 AND role != 'owner'", [targetSchoolId]);
+    await db.query("DELETE FROM attendance_records WHERE school_id = $1", [targetSchoolId]);
+    await db.query("DELETE FROM attendance_sessions WHERE school_id = $1", [targetSchoolId]);
+    await db.query("DELETE FROM schedule_slots WHERE school_id = $1", [targetSchoolId]);
+    await db.query("DELETE FROM assignments WHERE school_id = $1", [targetSchoolId]);
+    await db.query("DELETE FROM students WHERE school_id = $1", [targetSchoolId]);
+    await db.query("DELETE FROM classes WHERE school_id = $1", [targetSchoolId]);
+    await db.query("DELETE FROM teachers WHERE school_id = $1", [targetSchoolId]);
+    await db.query("DELETE FROM subjects WHERE school_id = $1", [targetSchoolId]);
+
+    return reply.send({ status: 'ok', message: `Maktab #${targetSchoolId} ning barcha o'qituvchilari, fanlari va o'quvchilari to'liq tozalandi!` });
+  });
+
+  // Maktab nomini va sozlamalarini o'zgartirish
+  app.put('/api/v1/owner/schools/:id', async (request: FastifyRequest<{ Params: { id: string }; Body: { name?: string; code?: string; status?: string } }>, reply: FastifyReply) => {
+    const auth = await getAuth(request, db);
+    if (!auth || auth.user.role !== 'owner') {
+      return reply.status(403).send({ error: 'Faqat platforma egasi (owner) uchun' });
+    }
+
+    const schoolId = Number(request.params.id);
+    const { name, code, status } = request.body || {};
+    if (name) await db.query('UPDATE schools SET name = $1 WHERE id = $2', [name.trim(), schoolId]);
+    if (code) await db.query('UPDATE schools SET code = $1 WHERE id = $2', [code.trim(), schoolId]);
+    if (status) await db.query('UPDATE schools SET status = $1 WHERE id = $2', [status, schoolId]);
+
+    return reply.send({ status: 'ok', message: 'Maktab ma\'lumotlari yangilandi' });
+  });
+
+  // Maktabni o'chirish
+  app.delete('/api/v1/owner/schools/:id', async (request: FastifyRequest<{ Params: { id: string } }>, reply: FastifyReply) => {
+    const auth = await getAuth(request, db);
+    if (!auth || auth.user.role !== 'owner') {
+      return reply.status(403).send({ error: 'Faqat platforma egasi (owner) uchun' });
+    }
+
+    const schoolId = Number(request.params.id);
+    const countRes = await db.query('SELECT COUNT(*) as c FROM schools');
+    if (parseInt(countRes.rows[0].c, 10) <= 1) {
+      return reply.status(400).send({ error: 'Oxirgi maktabni o\'chirib bo\'lmaydi' });
+    }
+
+    await db.query('DELETE FROM schools WHERE id = $1', [schoolId]);
+    return reply.send({ status: 'ok', message: 'Maktab to\'liq o\'chirildi' });
+  });
+
+  // Har qanday foydalanuvchi parolini yangilash (Reset password)
+  app.post('/api/v1/owner/users/:id/reset-password', async (request: FastifyRequest<{ Params: { id: string }; Body: { password?: string } }>, reply: FastifyReply) => {
+    const auth = await getAuth(request, db);
+    if (!auth || auth.user.role !== 'owner') {
+      return reply.status(403).send({ error: 'Faqat platforma egasi (owner) uchun' });
+    }
+
+    const userId = Number(request.params.id);
+    const newPass = request.body?.password?.trim() || generateTempPassword(10);
+    const pwHash = await hashPassword(newPass);
+
+    await db.query('UPDATE users SET password_hash = $1, must_change_password = false WHERE id = $2', [pwHash, userId]);
+    return reply.send({ status: 'ok', temporary_password: newPass, message: 'Parol muvaffaqiyatli o\'rnatildi' });
+  });
+
+  // Foydalanuvchi rolini o'zgartirish
+  app.put('/api/v1/owner/users/:id/role', async (request: FastifyRequest<{ Params: { id: string }; Body: { role: string } }>, reply: FastifyReply) => {
+    const auth = await getAuth(request, db);
+    if (!auth || auth.user.role !== 'owner') {
+      return reply.status(403).send({ error: 'Faqat platforma egasi (owner) uchun' });
+    }
+
+    const userId = Number(request.params.id);
+    const newRole = request.body?.role;
+    if (!['owner', 'director', 'admin', 'teacher', 'student'].includes(newRole)) {
+      return reply.status(400).send({ error: 'Noto\'g\'ri rol' });
+    }
+
+    const uRes = await db.query('SELECT role FROM users WHERE id = $1', [userId]);
+    if (uRes.rows.length === 0) return reply.status(404).send({ error: 'Foydalanuvchi topilmadi' });
+    if (uRes.rows[0].role === 'owner' && newRole !== 'owner') {
+      return reply.status(403).send({ error: "Platforma egasining (owner) rolini pasaytirish taqiqlanadi" });
+    }
+
+    await db.query('UPDATE users SET role = $1 WHERE id = $2', [newRole, userId]);
+    await logAudit(db, {
+      school_id: auth.user.support_school_id || null,
+      user_id: auth.user.id,
+      action: 'USER_ROLE_CHANGED',
+      entity: 'user',
+      entity_id: String(userId),
+      details: { old_role: uRes.rows[0].role, new_role: newRole },
+    });
+    return reply.send({ status: 'ok', message: 'Rol yangilandi' });
+  });
+
+  // Foydalanuvchini bloklash / faollashtirish (Status: active / blocked)
+  app.put('/api/v1/owner/users/:id/status', async (request: FastifyRequest<{ Params: { id: string }; Body: { status: 'active' | 'blocked' } }>, reply: FastifyReply) => {
+    const auth = await getAuth(request, db);
+    if (!auth || auth.user.role !== 'owner') {
+      return reply.status(403).send({ error: 'Faqat platforma egasi (owner) uchun' });
+    }
+
+    const userId = Number(request.params.id);
+    const newStatus = request.body?.status === 'blocked' ? 'blocked' : 'active';
+
+    const uRes = await db.query('SELECT role FROM users WHERE id = $1', [userId]);
+    if (uRes.rows.length === 0) return reply.status(404).send({ error: 'Foydalanuvchi topilmadi' });
+    if (uRes.rows[0].role === 'owner') {
+      return reply.status(403).send({ error: 'Platforma egasini (owner) bloklash taqiqlanadi' });
+    }
+
+    await db.query('UPDATE users SET status = $1 WHERE id = $2', [newStatus, userId]);
+    if (newStatus === 'blocked') {
+      await db.query('DELETE FROM sessions WHERE user_id = $1', [userId]);
+    }
+
+    await logAudit(db, {
+      school_id: auth.user.support_school_id || null,
+      user_id: auth.user.id,
+      action: newStatus === 'blocked' ? 'USER_BLOCKED' : 'USER_UNBLOCKED',
+      entity: 'user',
+      entity_id: String(userId),
+    });
+
+    return reply.send({ status: 'ok', message: newStatus === 'blocked' ? 'Foydalanuvchi bloklandi' : 'Foydalanuvchi faollashtirildi' });
+  });
+
+  // Telegram bot orqali ommaviy xabar yuborish (Broadcast)
+  app.post('/api/v1/owner/broadcast', async (request: FastifyRequest<{ Body: { text: string; target?: string } }>, reply: FastifyReply) => {
+    const auth = await getAuth(request, db);
+    if (!auth || auth.user.role !== 'owner') {
+      return reply.status(403).send({ error: 'Faqat platforma egasi (owner) uchun' });
+    }
+
+    const text = request.body?.text?.trim();
+    if (!text) return reply.status(400).send({ error: 'Xabar matnini kiriting' });
+    const target = request.body?.target || 'all';
+
+    const { getBot } = await import('../telegram/bot.js');
+    const bot = getBot();
+
+    const chatIds: number[] = [];
+    if (target === 'parents' || target === 'all') {
+      const pRes = await db.query("SELECT DISTINCT telegram_chat_id FROM parent_contacts WHERE telegram_chat_id IS NOT NULL AND status = 'connected'");
+      chatIds.push(...pRes.rows.map(r => Number(r.telegram_chat_id)));
+    }
+    if (target === 'teachers' || target === 'directors' || target === 'all') {
+      const tiRes = await db.query("SELECT DISTINCT telegram_id FROM telegram_identities WHERE telegram_id IS NOT NULL AND unbound_at IS NULL");
+      chatIds.push(...tiRes.rows.map(r => Number(r.telegram_id)));
+    }
+
+    const uniqueChatIds = Array.from(new Set(chatIds.filter(Boolean)));
+    let successCount = 0;
+    if (bot) {
+      for (const cid of uniqueChatIds) {
+        try {
+          await bot.api.sendMessage(cid, `📢 Platforma Rahbari xabari:\n\n${text}`);
+          successCount++;
+        } catch {
+          // ignore error per chat
+        }
+      }
+    }
+
+    await logAudit(db, {
+      school_id: auth.user.support_school_id || null,
+      user_id: auth.user.id,
+      action: 'BROADCAST_SENT',
+      entity: 'broadcast',
+      details: { target, total_recipients: uniqueChatIds.length, success_count: successCount },
+    });
+
+    return reply.send({
+      status: 'ok',
+      message: `Xabar ${successCount} ta Telegram profiliga muvaffaqiyatli yuborildi`,
+      total_recipients: uniqueChatIds.length,
+      success_count: successCount,
+    });
+  });
+
+  // Favqulodda kirish havolasi (Emergency break-glass link)
+  app.post('/api/v1/owner/generate-break-glass', async (request: FastifyRequest, reply: FastifyReply) => {
+    const auth = await getAuth(request, db);
+    if (!auth || auth.user.role !== 'owner') {
+      return reply.status(403).send({ error: 'Faqat platforma egasi (owner) uchun' });
+    }
+
+    const token = crypto.randomBytes(32).toString('hex');
+    const tokenHash = hashSessionToken(token);
+    const expiresAt = new Date(Date.now() + 60 * 60 * 1000); // 1 hour
+
+    await db.query(
+      `INSERT INTO sessions (id, user_id, school_id, token_hash, expires_at)
+       VALUES ($1, $2, NULL, $3, $4)`,
+      [tokenHash, auth.user.id, tokenHash, expiresAt.toISOString()]
+    );
+
+    const baseUrl = process.env.PUBLIC_URL || (process.env.RENDER_EXTERNAL_URL ? process.env.RENDER_EXTERNAL_URL.replace(/\/$/, '') : `http://${request.headers.host}`);
+    return reply.send({
+      status: 'ok',
+      link: `${baseUrl}/?token=${token}`,
+      expires_at: expiresAt.toISOString(),
+    });
   });
 }

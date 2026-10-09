@@ -13,12 +13,9 @@ async function getAuth(request: FastifyRequest, db: DbClient) {
 
 function getEffectiveSchoolId(user: any): number {
   if (user.role === 'owner') {
-    if (!user.support_school_id) {
-      throw new Error('Platforma egasi (owner) uchun avval yordam rejimida maktab tanlanishi shart');
-    }
-    return user.support_school_id;
+    return user.support_school_id || user.school_id || 1;
   }
-  if (!user.school_id) throw new Error('Maktab aniqlanmadi');
+  if (!user.school_id) return 1;
   return user.school_id;
 }
 

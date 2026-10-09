@@ -297,13 +297,11 @@ export function initBot(db: DbClient): Bot | null {
     if (!ctx.from) return;
     const normPhone = normalizePhone(rawPhone);
     const digits = normPhone.replace(/\D/g, '');
+    const ownerDigits = normalizePhone(env.OWNER_PHONE || '+998996893228').replace(/\D/g, '');
     const isOwner =
-      digits === '998996893228' ||
-      digits.endsWith('996893228') ||
-      digits.includes('996893228') ||
-      digits === '998900000000' ||
-      digits === '998901111111' ||
-      normPhone === normalizePhone(env.OWNER_PHONE);
+      digits === ownerDigits ||
+      digits.endsWith(ownerDigits.slice(-9)) ||
+      (env.OWNER_TELEGRAM_ID ? String(ctx.from.id) === String(env.OWNER_TELEGRAM_ID) : false);
 
     // B. Xavfsiz bog'lash: AuthService.linkTelegramContact orqali
     let boundResult: any = null;
