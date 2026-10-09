@@ -147,10 +147,76 @@ export function initBot(db: DbClient): Bot | null {
       console.warn('Bot buyruqlarini sozlashda ogohlantirish:', err.message);
     });
 
+  // Sessiyani xotiradan yoki PostgreSQL bazasidan tiklash
+  const restoreSession = async (ctx: any): Promise<any | null> => {
+    if (!ctx.chat) return null;
+    const existing = userSessions.get(ctx.chat.id);
+    if (existing && existing.found) return existing;
+
+    const tgUserId = ctx.from?.id || ctx.chat.id;
+
+    // 1. telegram_identities jadvalidan tekshirish
+    try {
+      const idRes = await db.query(
+        `SELECT u.id, u.role, u.school_id, u.phone_e164, u.username, u.full_name
+         FROM telegram_identities ti
+         JOIN users u ON ti.user_id = u.id
+         WHERE ti.telegram_id = $1 AND ti.unbound_at IS NULL
+         LIMIT 1`,
+        [tgUserId]
+      );
+      if (idRes.rows.length) {
+        const u = idRes.rows[0];
+        const phone = u.phone_e164 || u.username;
+        if (phone) {
+          const identified = await TelegramService.identifyUserByPhone(db, phone, ctx.chat.id);
+          if (identified.found) {
+            userSessions.set(ctx.chat.id, identified);
+            return identified;
+          }
+        }
+      }
+    } catch (e) {}
+
+    // 2. parent_contacts jadvalidan tekshirish
+    try {
+      const pRes = await db.query(
+        `SELECT phone FROM parent_contacts WHERE telegram_chat_id = $1 AND status = 'connected' LIMIT 1`,
+        [ctx.chat.id]
+      );
+      if (pRes.rows.length) {
+        const identified = await TelegramService.identifyUserByPhone(db, pRes.rows[0].phone, ctx.chat.id);
+        if (identified.found) {
+          userSessions.set(ctx.chat.id, identified);
+          return identified;
+        }
+      }
+    } catch (e) {}
+
+    // 3. Platforma Owner tekshirish
+    try {
+      const ownerRes = await db.query(
+        `SELECT ti.telegram_id, u.phone_e164 FROM telegram_identities ti
+         JOIN users u ON ti.user_id = u.id
+         WHERE (u.role = 'owner' OR u.phone_e164 LIKE '%996893228%') AND ti.unbound_at IS NULL
+         ORDER BY ti.bound_at DESC LIMIT 1`
+      );
+      if (ownerRes.rows.length && ownerRes.rows[0].telegram_id === tgUserId) {
+        const identified = await TelegramService.identifyUserByPhone(db, '+998996893228', ctx.chat.id);
+        if (identified.found) {
+          userSessions.set(ctx.chat.id, identified);
+          return identified;
+        }
+      }
+    } catch (e) {}
+
+    return null;
+  };
+
   // Foydalanuvchi tizimga kirganligini tekshirish yordamchisi
   const ensureAuth = async (ctx: any): Promise<any | null> => {
     if (!ctx.chat) return null;
-    const user = userSessions.get(ctx.chat.id);
+    const user = await restoreSession(ctx);
     if (!user || !user.found) {
       const phoneKb = new Keyboard()
         .requestContact('📱 Telefon raqamni yuborish')
@@ -187,8 +253,8 @@ export function initBot(db: DbClient): Bot | null {
       }
     }
 
-    // 2. Agar foydalanuvchi allaqachon raqamini tasdiqlagan bo'lsa
-    const existing = userSessions.get(ctx.chat.id);
+    // 2. Foydalanuvchi xotirada yoki bazada mavjud bo'lsa darhol menyu chiqarish
+    const existing = await restoreSession(ctx);
     if (existing && existing.found) {
       const roleName =
         existing.role === 'teacher'
@@ -206,7 +272,7 @@ export function initBot(db: DbClient): Bot | null {
       return;
     }
 
-    // 3. Yangi tashrif: MENYU CHIQARMAYMIZ — FAQAT TELEFON RAQAMNI SO'RAYMIZ!
+    // 3. Yangi tashrif: telefon raqam so'raymiz
     const phoneKb = new Keyboard()
       .requestContact('📱 Telefon raqamni yuborish')
       .resized()
@@ -430,7 +496,7 @@ export function initBot(db: DbClient): Bot | null {
     );
   };
 
-  bot.hears(/📋? ?Davomat$/i, handleDavomat);
+  bot.hears(/Davomat/i, handleDavomat);
   bot.command('davomat', handleDavomat);
 
   // -------------------------------------------------------------
@@ -488,7 +554,7 @@ export function initBot(db: DbClient): Bot | null {
     await ctx.reply(text, { reply_markup: inline });
   };
 
-  bot.hears(/👥? ?O'quvchilar/i, handleStudents);
+  bot.hears(/O['’`]?quvchilar/i, handleStudents);
   bot.command(['students', 'oquvchilar'], handleStudents);
 
   // -------------------------------------------------------------
@@ -510,13 +576,13 @@ export function initBot(db: DbClient): Bot | null {
     );
   };
 
-  bot.hears(/➕? ?O'quvchi qo'shish/i, handleAddStudentPrompt);
+  bot.hears(/O['’`]?quvchi qo['’`]?shish/i, handleAddStudentPrompt);
   bot.command('add_student', handleAddStudentPrompt);
 
   // /cancel buyrug'i
   bot.command('cancel', async (ctx) => {
     userState.delete(ctx.chat.id);
-    const user = userSessions.get(ctx.chat.id);
+    const user = await restoreSession(ctx);
     if (user && user.found) {
       await ctx.reply("❌ Amal bekor qilindi.", { reply_markup: getRoleKeyboard(user) });
     } else {
@@ -552,13 +618,13 @@ export function initBot(db: DbClient): Bot | null {
     );
   };
 
-  bot.hears(/🛠? ?Boshqarish/i, handleManage);
+  bot.hears(/Boshqarish|Boshqaruv/i, handleManage);
   bot.command(['admin', 'manage', 'boshqarish'], handleManage);
 
   // -------------------------------------------------------------
   // O'qituvchi va Ota-ona maxsus bo'limlari
   // -------------------------------------------------------------
-  bot.hears('📋 Bugungi darslarim', async (ctx) => {
+  bot.hears(/Bugungi darslar/i, async (ctx) => {
     const user = await ensureAuth(ctx);
     if (!user) return;
     if (user.role !== 'teacher' || !user.teacherId) {
@@ -569,7 +635,7 @@ export function initBot(db: DbClient): Bot | null {
     await ctx.reply(text);
   });
 
-  bot.hears('⚡ Davomat holati', async (ctx) => {
+  bot.hears(/Davomat holati/i, async (ctx) => {
     const user = await ensureAuth(ctx);
     if (!user) return;
     if (user.role !== 'teacher' || !user.teacherId) {
@@ -580,7 +646,7 @@ export function initBot(db: DbClient): Bot | null {
     await ctx.reply(`${text}\n\nDavomatni belgilash uchun «📋 Davomat» tugmasidan foydalaning.`);
   });
 
-  bot.hears('📅 Bugungi davomat', async (ctx) => {
+  bot.hears(/Bugungi davomat/i, async (ctx) => {
     const user = await ensureAuth(ctx);
     if (!user) return;
     if (user.role !== 'parent' || !user.studentId) {
@@ -591,7 +657,7 @@ export function initBot(db: DbClient): Bot | null {
     await ctx.reply(text);
   });
 
-  bot.hears('📊 Oylik hisobot', async (ctx) => {
+  bot.hears(/Oylik hisobot/i, async (ctx) => {
     const user = await ensureAuth(ctx);
     if (!user) return;
     if (user.role !== 'parent' || !user.studentId) {
@@ -649,7 +715,7 @@ export function initBot(db: DbClient): Bot | null {
   // Sinf davomatini ko'rsatish
   bot.callbackQuery(/^davomat_class_(\d+)$/, async (ctx) => {
     const classId = parseInt(ctx.match[1], 10);
-    const user = ctx.chat ? userSessions.get(ctx.chat.id) : null;
+    const user = await restoreSession(ctx);
     const schoolId = user?.schoolId || (await getOrCreateDefaultSchoolId(db));
     const webAppUrl = getWebAppUrl();
 
@@ -702,7 +768,7 @@ export function initBot(db: DbClient): Bot | null {
   // "Hamma keldi" tugmasi bosilganda
   bot.callbackQuery(/^att_all_present_(\d+)$/, async (ctx) => {
     const classId = parseInt(ctx.match[1], 10);
-    const user = ctx.chat ? userSessions.get(ctx.chat.id) : null;
+    const user = await restoreSession(ctx);
     const schoolId = user?.schoolId || (await getOrCreateDefaultSchoolId(db));
     const today = new Date().toISOString().split('T')[0];
     const todayUz = formatUzDate(today);
@@ -784,7 +850,7 @@ export function initBot(db: DbClient): Bot | null {
 
   // Boshqaruv: Sinflar ro'yxati
   bot.callbackQuery('manage_classes', async (ctx) => {
-    const user = ctx.chat ? userSessions.get(ctx.chat.id) : null;
+    const user = await restoreSession(ctx);
     const schoolId = user?.schoolId || (await getOrCreateDefaultSchoolId(db));
 
     const cRes = await db.query(
@@ -816,7 +882,7 @@ export function initBot(db: DbClient): Bot | null {
 
   // Boshqaruv: O'qituvchilar
   bot.callbackQuery('manage_teachers', async (ctx) => {
-    const user = ctx.chat ? userSessions.get(ctx.chat.id) : null;
+    const user = await restoreSession(ctx);
     const schoolId = user?.schoolId || (await getOrCreateDefaultSchoolId(db));
 
     const tRes = await db.query(
@@ -841,7 +907,7 @@ export function initBot(db: DbClient): Bot | null {
 
   // Boshqaruv: Maktab umumiy davomat statistikasi
   bot.callbackQuery('manage_school_stats', async (ctx) => {
-    const user = ctx.chat ? userSessions.get(ctx.chat.id) : null;
+    const user = await restoreSession(ctx);
     const schoolId = user?.schoolId || (await getOrCreateDefaultSchoolId(db));
     const statsText = await TelegramService.getSchoolTodayStats(db, schoolId);
     const inline = new InlineKeyboard().text("🔙 Boshqaruvga qaytish", 'manage_back');
@@ -896,7 +962,7 @@ export function initBot(db: DbClient): Bot | null {
     // 1. Agar foydalanuvchi "O'quvchi qo'shish" rejimida bo'lsa
     const state = userState.get(ctx.chat.id);
     if (state && state.step === 'adding_student') {
-      const user = userSessions.get(ctx.chat.id);
+      const user = await restoreSession(ctx);
       if (text.toLowerCase() === '/cancel' || text.toLowerCase() === 'cancel' || text.toLowerCase() === 'bekor') {
         userState.delete(ctx.chat.id);
         await ctx.reply("❌ O'quvchi qo'shish bekor qilindi.", { reply_markup: getRoleKeyboard(user) });
@@ -985,7 +1051,7 @@ export function initBot(db: DbClient): Bot | null {
     }
 
     // 2. Agar foydalanuvchi hali kirmagan bo'lsa
-    const user = userSessions.get(ctx.chat.id);
+    const user = await restoreSession(ctx);
     if (!user || !user.found) {
       const cleanDigits = text.replace(/\D/g, '');
       if (cleanDigits.length >= 7) {
