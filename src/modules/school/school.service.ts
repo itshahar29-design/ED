@@ -1,4 +1,5 @@
 import { DbClient } from '../../db/client.js';
+import { hashPassword } from '../auth/crypto.js';
 
 export interface CreateStudentInput {
   class_id: number;
@@ -140,24 +141,109 @@ export class SchoolService {
     const countRes = await db.query('SELECT COUNT(*) as c FROM teachers WHERE school_id = $1', [schoolId]);
     const num = parseInt(countRes.rows[0].c, 10) + 1;
     const cd = code?.trim() || `T-${String(num).padStart(2, '0')}`;
+    const pos = position?.trim() || 'O\'qituvchi';
+    const ph = phone?.trim() || '';
 
     const res = await db.query(
       'INSERT INTO teachers (school_id, name, code, phone, position, status) VALUES ($1, $2, $3, $4, $5, \'a\') RETURNING id, name, code, phone, position as pos, status as st',
-      [schoolId, trimmed, cd, phone?.trim() || '', position?.trim() || 'O\'qituvchi']
+      [schoolId, trimmed, cd, ph, pos]
     );
-    return res.rows[0];
+    const teacher = res.rows[0];
+
+    // Agar telefon kiritilgan bo'lsa, avtomatik tizim foydalanuvchisini yaratish (login uchun)
+    if (ph) {
+      try {
+        let role = 'teacher';
+        const pLow = pos.toLowerCase();
+        if (pLow.includes('direktor') && !pLow.includes('o\'rinbosar')) {
+          role = 'director';
+        } else if (pLow.includes('o\'rinbosar') || pLow.includes('zavuch') || pLow.includes('admin')) {
+          role = 'admin';
+        }
+
+        const normPhone = ph.startsWith('+') ? ph : ('+' + ph.replace(/\D/g, ''));
+        const uEx = await db.query('SELECT id FROM users WHERE phone_e164 = $1 OR username = $1 LIMIT 1', [normPhone]);
+        let userId: number;
+        if (uEx.rows.length === 0) {
+          const pwHash = await hashPassword('Maktab123!');
+          const insU = await db.query(
+            `INSERT INTO users (school_id, username, password_hash, role, teacher_id, phone_e164, full_name, status, must_change_password)
+             VALUES ($1, $2, $3, $4, $5, $2, $6, 'active', false)
+             RETURNING id`,
+            [schoolId, normPhone, pwHash, role, teacher.id, trimmed]
+          );
+          userId = insU.rows[0].id;
+        } else {
+          userId = uEx.rows[0].id;
+          await db.query(
+            'UPDATE users SET school_id = $1, role = $2, teacher_id = $3, full_name = $4 WHERE id = $5',
+            [schoolId, role, teacher.id, trimmed, userId]
+          );
+        }
+
+        const posRes = await db.query('SELECT id FROM positions WHERE school_id = $1 AND key = $2 LIMIT 1', [schoolId, role]);
+        if (posRes.rows.length) {
+          await db.query(
+            `INSERT INTO memberships (user_id, school_id, position_id, teacher_id, status)
+             VALUES ($1, $2, $3, $4, 'active')
+             ON CONFLICT DO NOTHING`,
+            [userId, schoolId, posRes.rows[0].id, teacher.id]
+          );
+        }
+      } catch (e) {
+        console.warn('O\'qituvchiga login yaratishda ogohlantirish:', e);
+      }
+    }
+
+    return teacher;
   }
 
   static async updateTeacher(db: DbClient, schoolId: number, id: number, name: string, code?: string, phone?: string, position?: string) {
     const trimmed = name.trim();
     if (!trimmed) throw new Error('O\'qituvchi ismini kiriting');
 
+    const pos = position?.trim() || 'O\'qituvchi';
+    const ph = phone?.trim() || '';
+
     const res = await db.query(
       'UPDATE teachers SET name = $1, code = $2, phone = $3, position = $4 WHERE school_id = $5 AND id = $6 RETURNING id, name, code, phone, position as pos, status as st',
-      [trimmed, code?.trim() || `T-${id}`, phone?.trim() || '', position?.trim() || 'O\'qituvchi', schoolId, id]
+      [trimmed, code?.trim() || `T-${id}`, ph, pos, schoolId, id]
     );
     if (res.rows.length === 0) throw new Error('O\'qituvchi topilmadi');
-    return res.rows[0];
+    const teacher = res.rows[0];
+
+    if (ph) {
+      try {
+        let role = 'teacher';
+        const pLow = pos.toLowerCase();
+        if (pLow.includes('direktor') && !pLow.includes('o\'rinbosar')) {
+          role = 'director';
+        } else if (pLow.includes('o\'rinbosar') || pLow.includes('zavuch') || pLow.includes('admin')) {
+          role = 'admin';
+        }
+
+        const normPhone = ph.startsWith('+') ? ph : ('+' + ph.replace(/\D/g, ''));
+        const uEx = await db.query('SELECT id FROM users WHERE teacher_id = $1 AND school_id = $2 LIMIT 1', [id, schoolId]);
+        if (uEx.rows.length) {
+          await db.query(
+            'UPDATE users SET username = $1, phone_e164 = $1, full_name = $2, role = $3 WHERE id = $4',
+            [normPhone, trimmed, role, uEx.rows[0].id]
+          );
+        } else {
+          const pwHash = await hashPassword('Maktab123!');
+          await db.query(
+            `INSERT INTO users (school_id, username, password_hash, role, teacher_id, phone_e164, full_name, status, must_change_password)
+             VALUES ($1, $2, $3, $4, $5, $2, $6, 'active', false)
+             ON CONFLICT (phone_e164) DO UPDATE SET teacher_id = EXCLUDED.teacher_id, role = EXCLUDED.role, full_name = EXCLUDED.full_name`,
+            [schoolId, normPhone, pwHash, role, id, trimmed]
+          );
+        }
+      } catch (e) {
+        console.warn('O\'qituvchi hisobini yangilashda ogohlantirish:', e);
+      }
+    }
+
+    return teacher;
   }
 
   static async setTeacherStatus(db: DbClient, schoolId: number, id: number, status: 'a' | 'x') {

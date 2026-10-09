@@ -1059,16 +1059,24 @@ export class AuthService {
           const uDb = await db.query('SELECT * FROM users WHERE id = $1', [teacher.user_id]);
           targetUser = uDb.rows[0];
         } else {
+          let teacherRole = 'teacher';
+          const pLow = (teacher.position || '').toLowerCase();
+          if (pLow.includes('direktor') && !pLow.includes('o\'rinbosar')) {
+            teacherRole = 'director';
+          } else if (pLow.includes('o\'rinbosar') || pLow.includes('zavuch') || pLow.includes('admin')) {
+            teacherRole = 'admin';
+          }
+
           const pwHash = await hashPassword('Teacher123!');
           const created = await db.query(
             `INSERT INTO users (school_id, username, password_hash, role, teacher_id, phone_e164, full_name, must_change_password)
-             VALUES ($1, $2, $3, 'teacher', $4, $2, $5, false)
+             VALUES ($1, $2, $3, $4, $5, $2, $6, false)
              RETURNING *`,
-            [teacher.school_id, teacher.phone || ('t_' + teacher.id), pwHash, teacher.id, teacher.name]
+            [teacher.school_id, teacher.phone || ('t_' + teacher.id), pwHash, teacherRole, teacher.id, teacher.name]
           );
           targetUser = created.rows[0];
           // Membership
-          const pos = await db.query("SELECT id FROM positions WHERE school_id = $1 AND key = 'teacher' LIMIT 1", [teacher.school_id]);
+          const pos = await db.query("SELECT id FROM positions WHERE school_id = $1 AND key = $2 LIMIT 1", [teacher.school_id, teacherRole]);
           if (pos.rows.length) {
             await db.query(
               `INSERT INTO memberships (user_id, school_id, position_id, teacher_id, status)
@@ -1408,7 +1416,7 @@ export class AuthService {
     creatorUser: AuthUser,
     data: {
       username: string;
-      role: 'admin' | 'teacher' | 'student';
+      role: 'director' | 'admin' | 'teacher' | 'student';
       phone?: string;
       full_name?: string;
       teacher_id?: number | null;
@@ -1416,11 +1424,18 @@ export class AuthService {
     },
     ipAddress?: string
   ): Promise<{ id: number; username: string; tempPassword: string; role: string }> {
-    const schoolId = creatorUser.role === 'owner' ? creatorUser.support_school_id : creatorUser.school_id;
+    let schoolId = creatorUser.role === 'owner' ? creatorUser.support_school_id : creatorUser.school_id;
+    if (!schoolId && creatorUser.role === 'owner') {
+      const sch = await db.query('SELECT id FROM schools ORDER BY id ASC LIMIT 1');
+      schoolId = sch.rows[0]?.id;
+    }
     if (!schoolId) {
       throw new Error('Maktab aniqlanmadi');
     }
 
+    if (data.role === 'director' && creatorUser.role !== 'owner') {
+      throw new Error('Faqat platforma egasi direktor hisobini yarata oladi');
+    }
     if (creatorUser.role === 'admin' && data.role === 'admin') {
       throw new Error('Admin boshqa admin yarata olmaydi');
     }

@@ -462,7 +462,7 @@ export async function bootstrapRoutes(app: FastifyInstance) {
 
     const schema = z.object({
       username: z.string().min(3, 'Username kamida 3 ta belgi bo\'lsin'),
-      role: z.enum(['admin', 'teacher', 'student']),
+      role: z.enum(['director', 'admin', 'teacher', 'student']),
       teacher_id: z.coerce.number().optional(),
       student_id: z.coerce.number().optional(),
     });
