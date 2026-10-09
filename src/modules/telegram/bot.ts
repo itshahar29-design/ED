@@ -32,14 +32,12 @@ export function getRoleKeyboard(user: any): Keyboard {
   if (role === 'teacher') {
     return new Keyboard()
       .text('📋 Bugungi darslarim')
-      .text('⚡ Davomat holati')
-      .row()
       .text('📋 Davomat')
+      .row()
       .text("👥 O'quvchilar")
+      .webApp('🌐 Web Panel', webAppUrl)
       .row()
-      .webApp('🌐 Sayt orqali davomat (Web App)', webAppUrl)
-      .row()
-      .text('🔄 Chiqish / Raqamni almashtirish')
+      .text('🔄 Raqamni almashtirish')
       .resized();
   }
 
@@ -48,24 +46,23 @@ export function getRoleKeyboard(user: any): Keyboard {
       .text('📅 Bugungi davomat')
       .text('📊 Oylik hisobot')
       .row()
-      .webApp('🌐 Sayt orqali davomat (Web App)', webAppUrl)
+      .webApp('🌐 Web Panel', webAppUrl)
       .row()
-      .text('🔄 Chiqish / Raqamni almashtirish')
+      .text('🔄 Raqamni almashtirish')
       .resized();
   }
 
-  // Owner yoki Director uchun to'liq menyu
+  // Owner yoki Director uchun to'liq mantiqiy menyu
   return new Keyboard()
-    .webApp('🌐 Sayt orqali davomat (Web App)', webAppUrl)
-    .row()
     .text('📋 Davomat')
-    .row()
     .text("👥 O'quvchilar")
+    .row()
     .text("➕ O'quvchi qo'shish")
+    .text('📊 Boshqarish')
     .row()
-    .text('🛠 Boshqarish')
+    .webApp('🌐 Web Panel', webAppUrl)
     .row()
-    .text('🔄 Chiqish / Raqamni almashtirish')
+    .text('🔄 Raqamni almashtirish')
     .resized();
 }
 
