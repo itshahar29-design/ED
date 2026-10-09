@@ -469,31 +469,39 @@ DECLARE
   ];
 BEGIN
   FOREACH tbl IN ARRAY tenant_tables LOOP
-    EXECUTE format('ALTER TABLE %I ENABLE ROW LEVEL SECURITY;', tbl);
-    EXECUTE format('ALTER TABLE %I FORCE ROW LEVEL SECURITY;', tbl);
-    EXECUTE format('DROP POLICY IF EXISTS tenant_isolation_policy ON %I;', tbl);
-    IF tbl = 'positions' THEN
-      EXECUTE format(
-        'CREATE POLICY tenant_isolation_policy ON %I ' ||
-        'USING (school_id = NULLIF(current_setting(''app.school_id'', true), '''')::integer OR school_id IS NULL) ' ||
-        'WITH CHECK (school_id = NULLIF(current_setting(''app.school_id'', true), '''')::integer);',
-        tbl
-      );
-    ELSE
-      EXECUTE format(
-        'CREATE POLICY tenant_isolation_policy ON %I ' ||
-        'USING (school_id = NULLIF(current_setting(''app.school_id'', true), '''')::integer) ' ||
-        'WITH CHECK (school_id = NULLIF(current_setting(''app.school_id'', true), '''')::integer);',
-        tbl
-      );
-    END IF;
+    BEGIN
+      EXECUTE format('ALTER TABLE %I ENABLE ROW LEVEL SECURITY;', tbl);
+      EXECUTE format('ALTER TABLE %I FORCE ROW LEVEL SECURITY;', tbl);
+      EXECUTE format('DROP POLICY IF EXISTS tenant_isolation_policy ON %I;', tbl);
+      IF tbl = 'positions' THEN
+        EXECUTE format(
+          'CREATE POLICY tenant_isolation_policy ON %I ' ||
+          'USING (school_id = NULLIF(current_setting(''app.school_id'', true), '''')::integer OR school_id IS NULL) ' ||
+          'WITH CHECK (school_id = NULLIF(current_setting(''app.school_id'', true), '''')::integer);',
+          tbl
+        );
+      ELSE
+        EXECUTE format(
+          'CREATE POLICY tenant_isolation_policy ON %I ' ||
+          'USING (school_id = NULLIF(current_setting(''app.school_id'', true), '''')::integer) ' ||
+          'WITH CHECK (school_id = NULLIF(current_setting(''app.school_id'', true), '''')::integer);',
+          tbl
+        );
+      END IF;
+    EXCEPTION WHEN OTHERS THEN
+      NULL;
+    END;
   END LOOP;
 
-  IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'edumemory_app') THEN
-    CREATE ROLE edumemory_app;
-  END IF;
-  GRANT USAGE ON SCHEMA public TO edumemory_app;
-  GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO edumemory_app;
-  GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO edumemory_app;
+  BEGIN
+    IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'edumemory_app') THEN
+      CREATE ROLE edumemory_app;
+    END IF;
+    GRANT USAGE ON SCHEMA public TO edumemory_app;
+    GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO edumemory_app;
+    GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO edumemory_app;
+  EXCEPTION WHEN OTHERS THEN
+    NULL;
+  END;
 END $$;
 `;

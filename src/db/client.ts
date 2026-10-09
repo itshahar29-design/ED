@@ -38,7 +38,17 @@ class PgPoolClient implements DbClient {
     try {
       await client.query('BEGIN');
       if (schoolId !== undefined && schoolId !== null) {
-        await client.query(`SET LOCAL ROLE edumemory_app;`);
+        try {
+          await client.query('SAVEPOINT sp_role');
+          await client.query('SET LOCAL ROLE edumemory_app');
+          await client.query('RELEASE SAVEPOINT sp_role');
+        } catch {
+          try {
+            await client.query('ROLLBACK TO SAVEPOINT sp_role');
+          } catch {
+            // ignore savepoint rollback error
+          }
+        }
         await client.query('SET LOCAL app.school_id = $1', [schoolId.toString()]);
       }
       const wrappedClient: DbClient = {
